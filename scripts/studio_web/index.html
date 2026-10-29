@@ -20,6 +20,12 @@
     <span class="led"></span>
     <span id="device-chip-text">Gerät…</span>
   </button>
+  <button id="settings-open" class="icon-btn" title="Einstellungen" aria-label="Einstellungen">
+    <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    </svg>
+  </button>
 </header>
 
 <nav class="tabs" role="tablist">
@@ -193,6 +199,80 @@
     <button id="unassign-close" class="in-dismiss" title="Schließen">×</button>
   </div>
   <div id="unassign-body" class="md-body"></div>
+</dialog>
+
+<dialog id="settings-dialog" class="mini-dialog settings-dialog" aria-labelledby="settings-title">
+  <form id="settings-form" method="dialog" novalidate>
+    <div class="md-head">
+      <div class="md-title" id="settings-title">Einstellungen</div>
+      <button type="button" id="settings-close" class="in-dismiss" title="Schließen">×</button>
+    </div>
+    <div class="md-body settings-body">
+      <fieldset class="set-group">
+        <legend>Gerät</legend>
+        <label class="set-field" data-key="host">
+          <span class="set-label">Adresse</span>
+          <input class="input" name="host" type="text" placeholder="espuino.local" autocomplete="off" spellcheck="false">
+          <span class="set-hint">Netzwerkname oder IP-Adresse des ESPuino.</span>
+        </label>
+        <label class="set-field" data-key="remote_root">
+          <span class="set-label">Ordner auf dem Gerät</span>
+          <input class="input" name="remote_root" type="text" placeholder="/" autocomplete="off" spellcheck="false">
+          <span class="set-hint">Wohin der Sync die Mediathek spiegelt.</span>
+        </label>
+        <div class="set-pair">
+          <label class="set-field" data-key="http_user">
+            <span class="set-label">Benutzer</span>
+            <input class="input" name="http_user" type="text" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="set-field" data-key="http_password">
+            <span class="set-label">Passwort <button type="button" id="settings-pw-clear" class="link-btn" hidden>löschen</button></span>
+            <input class="input" name="http_password" type="password" autocomplete="new-password">
+          </label>
+        </div>
+        <span class="set-hint">Benutzer und Passwort nur, wenn die Weboberfläche des Geräts geschützt ist.</span>
+      </fieldset>
+
+      <fieldset class="set-group">
+        <legend>Funktionen</legend>
+        <label class="set-check" data-key="cards_enabled">
+          <input type="checkbox" name="cards_enabled">
+          <span><b>Kartendruck</b><span class="set-hint">Tab Kartendruck und Spalte Druck in der Bibliothek.</span></span>
+        </label>
+        <label class="set-check" data-key="agent_enabled">
+          <input type="checkbox" name="agent_enabled">
+          <span><b>Agent</b><span class="set-hint">Tab Agent und Laden per URL in der Bibliothek.</span></span>
+        </label>
+      </fieldset>
+
+      <fieldset class="set-group" id="settings-start">
+        <legend>Start</legend>
+        <label class="set-field set-narrow" data-key="port">
+          <span class="set-label">Port</span>
+          <input class="input" name="port" type="number" min="1024" max="65535" placeholder="8800">
+        </label>
+        <label class="set-check" data-key="open_browser">
+          <input type="checkbox" name="open_browser">
+          <span><b>Browser beim Start öffnen</b></span>
+        </label>
+        <span class="set-hint">Gilt ab dem nächsten Start von Studio.</span>
+      </fieldset>
+
+      <fieldset class="set-group">
+        <legend>Datenordner</legend>
+        <div id="settings-data-dir" class="mono set-path"></div>
+        <span class="set-hint" id="settings-data-hint"></span>
+      </fieldset>
+
+      <div id="settings-error" class="set-error" role="alert" hidden></div>
+    </div>
+    <div class="md-foot">
+      <span id="settings-file" class="set-file"></span>
+      <span class="spacer"></span>
+      <button type="button" id="settings-cancel" class="btn">Abbrechen</button>
+      <button type="submit" id="settings-save" class="btn primary">Speichern</button>
+    </div>
+  </form>
 </dialog>
 
 <div id="mode-popover" class="mode-popover" hidden></div>

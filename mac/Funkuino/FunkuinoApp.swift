@@ -64,8 +64,10 @@ final class StudioServer: ObservableObject {
 
         let proc = Process()
         proc.executableURL = dispatcher
-        proc.arguments = ["studio", "--port", String(port), "--no-browser",
-                          "--host", config.host]
+        // No --host: Studio reads the device from config.json, and a start
+        // parameter would pin it for the whole run, so a change made in
+        // Studio's settings dialog could not take effect.
+        proc.arguments = ["studio", "--port", String(port), "--no-browser"]
         // A GUI app inherits a minimal PATH. The bundle's own ffmpeg comes
         // first — a Homebrew one may be any build with any feature set — then
         // the usual locations, so a machine without the bundled copy still works.

@@ -11,7 +11,7 @@
  *   1. small DOM/format helpers        6. Sync tab
  *   2. REST client                     7. Karten tab
  *   3. global state + WS               8. Agent tab (sessions, events, cards)
- *   4. tabs + toasts                   9. init
+ *   4. tabs, toasts, settings          9. init
  *   5. Bibliothek tab
  */
 
@@ -356,6 +356,140 @@ function appendLog(id, line, isErr) {
   const atBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 40;
   pane.append(el("div", { class: isErr ? "err" : null, text: String(line == null ? "" : line) }));
   if (atBottom) pane.scrollTop = pane.scrollHeight;
+}
+
+/* ----- settings dialog ----- */
+
+/** Names the dialog uses, for the notes on settings that are not in force. */
+/** @type {Record<string, string>} */
+const SETTING_LABEL = {
+  host: "Adresse", remote_root: "Ordner auf dem Gerät", http_user: "Benutzer",
+  http_password: "Passwort", cards_enabled: "Kartendruck", agent_enabled: "Agent",
+  port: "Port", open_browser: "Browser beim Start",
+};
+/** @typedef {{ value: any, saved: any, override: string|null }} Setting */
+/** @type {{ settings: Record<string, Setting>, dataDir: string, configFile: string }|null} */
+let settingsData = null;
+let settingsPwClear = false;   // "löschen" clicked: send an empty password
+
+const isMacShell = () => document.documentElement.dataset.shell === "mac";
+
+/** @param {string} key @param {any} v */
+function fmtSetting(key, v) {
+  if (key === "http_password") return v ? "gesetzt" : "keins";
+  if (typeof v === "boolean") return v ? "an" : "aus";
+  return v === "" ? "leer" : String(v);
+}
+
+async function openSettings() {
+  try { settingsData = await api("/api/settings"); }
+  catch (/** @type {any} */ e) { toast("Einstellungen nicht ladbar: " + e.message); return; }
+  fillSettings();
+  const dlg = $("#settings-dialog");
+  if (!dlg.open) dlg.showModal();
+}
+
+function closeSettings() { const d = $("#settings-dialog"); if (d.open) d.close(); }
+
+// The fields show the *saved* values — what this dialog edits. Where a start
+// parameter or environment variable pins a setting for the running Studio, a
+// note under the field names it and the value actually in force.
+function fillSettings() {
+  if (!settingsData) return;
+  const form = $("#settings-form");
+  settingsPwClear = false;
+  for (const [key, st] of Object.entries(settingsData.settings)) {
+    const input = form.elements.namedItem(key);
+    if (!input) continue;
+    if (input.type === "checkbox") input.checked = !!st.saved;
+    else if (key === "http_password") { input.value = ""; input.placeholder = st.saved ? "gespeichert" : ""; }
+    else input.value = String(st.saved ?? "");
+    const field = form.querySelector(`[data-key="${key}"]`);
+    const old = field.nextElementSibling;
+    if (old && old.classList.contains("set-override")) old.remove();
+    if (st.override) {
+      const how = st.override.startsWith("-") ? "mit dem Startparameter " : "durch die Umgebungsvariable ";
+      field.after(el("div", { class: "set-override" },
+        "Für diesen Start festgelegt " + how, el("code", { text: st.override }),
+        ": ", el("b", { text: fmtSetting(key, st.value) }),
+        ". Was hier steht, gilt bei Starts ohne."));
+    }
+  }
+  $("#settings-pw-clear").hidden = !settingsData.settings.http_password.saved;
+  // The Mac app picks its own port and shows its own window.
+  $("#settings-start").hidden = isMacShell();
+  $("#settings-data-dir").textContent = settingsData.dataDir;
+  $("#settings-data-hint").textContent = isMacShell()
+    ? "Ändern über Funkuino › Einrichtung ändern… in der Menüleiste."
+    : "Ändern beim Start mit funkuino --data-dir … oder in der Einrichtung der Mac-App.";
+  $("#settings-file").textContent = "Gespeichert in " + settingsData.configFile;
+  $("#settings-file").title = settingsData.configFile;
+  $("#settings-error").hidden = true;
+}
+
+/** @param {Event} ev */
+async function saveSettings(ev) {
+  ev.preventDefault();
+  if (!settingsData) return;
+  const form = $("#settings-form");
+  /** @type {Record<string, any>} */
+  const body = {};
+  for (const [key, st] of Object.entries(settingsData.settings)) {
+    const input = form.elements.namedItem(key);
+    if (!input) continue;
+    let v;
+    if (input.type === "checkbox") v = input.checked;
+    else if (key === "http_password") {
+      if (settingsPwClear) v = "";
+      else if (input.value) v = input.value;
+      else continue;                       // empty field = keep the saved one
+    }
+    else if (key === "port") v = Number(input.value.trim() || 8800);
+    else v = input.value.trim();
+    if (key === "http_password" || v !== st.saved) body[key] = v;
+  }
+  if (!Object.keys(body).length) { closeSettings(); return; }
+  const btn = $("#settings-save");
+  btn.disabled = true;
+  try {
+    settingsData = await api("/api/settings", "POST", body);
+  } catch (/** @type {any} */ e) {
+    const err = $("#settings-error");
+    err.textContent = e.message;
+    err.hidden = false;
+    return;
+  } finally {
+    btn.disabled = false;
+  }
+  closeSettings();
+  // Say plainly which of the changes are not in force yet, and why.
+  const later = Object.keys(body).filter(k => {
+    const st = settingsData && settingsData.settings[k];
+    return st && st.value !== st.saved;
+  }).map(k => {
+    const st = /** @type {Setting} */ (settingsData && settingsData.settings[k]);
+    return SETTING_LABEL[k] + (st.override ? ` (für diesen Start mit ${st.override} festgelegt)`
+                                           : " (ab dem nächsten Start)");
+  });
+  toast(later.length ? "Gespeichert. Noch nicht in Kraft: " + later.join(", ") + "."
+                     : "Einstellungen gespeichert.", "ok");
+  refreshState();
+}
+
+function initSettings() {
+  $("#settings-open").addEventListener("click", openSettings);
+  $("#settings-close").addEventListener("click", closeSettings);
+  $("#settings-cancel").addEventListener("click", closeSettings);
+  $("#settings-form").addEventListener("submit", saveSettings);
+  $("#settings-pw-clear").addEventListener("click", () => {
+    settingsPwClear = true;
+    const pw = $("#settings-form").elements.namedItem("http_password");
+    pw.value = ""; pw.placeholder = "wird beim Speichern gelöscht";
+    $("#settings-pw-clear").hidden = true;
+  });
+  $("#settings-form").elements.namedItem("http_password").addEventListener("input", () => { settingsPwClear = false; });
+  // A click on the ::backdrop targets the <dialog> element itself → close.
+  $("#settings-dialog").addEventListener("click", (/** @type {any} */ e) => { if (e.target === $("#settings-dialog")) closeSettings(); });
 }
 
 /* =============================== 5. Bibliothek =============================== */
@@ -1982,6 +2116,7 @@ function init() {
   initSyncCards();
   initAgentUI();
   initRfid();
+  initSettings();
   initScrollShadow();
   refreshState();       // first paint even before WS is up
   connectWS();

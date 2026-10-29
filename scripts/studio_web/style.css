@@ -734,6 +734,54 @@ body.scrolled .picker-bar { box-shadow: 0 7px 8px -7px oklch(0.3 0.02 66 / .35);
 .unassign-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .unassign-row .mono { font-size: 12px; color: var(--ink-soft); }
 
+/* ---------- Settings (gear in the header + dialog) ---------- */
+
+.icon-btn {
+  display: inline-grid; place-items: center; width: 32px; height: 32px; margin-left: 8px;
+  border: 1px solid var(--line); border-radius: 50%; background: var(--surface);
+  color: var(--ink-soft); padding: 0;
+  transition: border-color .18s var(--ease), color .18s var(--ease);
+}
+.icon-btn:hover { border-color: var(--accent); color: var(--ink); }
+.icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.settings-dialog { width: min(540px, 94vw); max-height: 90vh; }
+.settings-dialog[open] { display: flex; flex-direction: column; }
+.settings-dialog form { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.settings-body { overflow-y: auto; gap: 18px; padding-top: 16px; }
+.set-group { border: 0; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.set-group legend {
+  padding: 0; margin-bottom: 8px; font-size: 11px; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink-faint);
+}
+.set-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.set-field .input { width: 100%; font-size: 13px; }
+.set-narrow { max-width: 140px; }
+.set-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.set-label { font-size: 12.5px; font-weight: 600; color: var(--ink); display: flex; gap: 8px; align-items: baseline; }
+.set-hint { display: block; font-size: 12px; color: var(--ink-faint); line-height: 1.4; }
+.set-check { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; cursor: pointer; }
+.set-check input { margin: 2px 0 0; accent-color: var(--accent); width: 15px; height: 15px; flex: none; }
+.set-check b { font-weight: 600; }
+.set-path { font-size: 12px; color: var(--ink-soft); word-break: break-all; }
+/* A start parameter / environment variable pins this setting for the running
+   Studio: say which, and what is in force, under the field. */
+.set-override {
+  font-size: 12px; line-height: 1.4; color: var(--ink-soft);
+  border-left: 2px solid var(--warn); padding: 2px 0 2px 8px;
+}
+.set-override code { font-family: var(--font-mono); font-size: 11.5px; }
+.set-error { font-size: 12.5px; color: var(--accent); }
+.link-btn {
+  appearance: none; border: 0; background: none; padding: 0; font-size: 11.5px; font-weight: 400;
+  color: var(--accent); text-decoration: underline; text-underline-offset: 2px; cursor: pointer;
+}
+.mini-dialog .md-foot {
+  display: flex; align-items: center; gap: 8px; padding: 12px 16px;
+  border-top: 1px solid var(--line); background: var(--surface-2);
+}
+.set-file { font-size: 11px; color: var(--ink-faint); font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
 /* ---------- Play-mode popover (Karte box hover/focus) ---------- */
 
 .mode-popover {

@@ -164,8 +164,11 @@ its library in the checkout, so cloning and running changes nothing outside it.
 
 Requirements for the source route: Python ≥ 3.10 and **ffmpeg** on PATH.
 
-Configuration: CLI flags > `ESPUINO_*` env vars > defaults (`ESPUINO_HOST`,
-`ESPUINO_LOCAL_DIR`, `ESPUINO_REMOTE_ROOT`, `ESPUINO_HTTP_USER`/`_PASSWORD`).
+Configuration: CLI flags > `ESPUINO_*` env vars > the settings saved in
+Studio's settings dialog > defaults (`ESPUINO_HOST`, `ESPUINO_LOCAL_DIR`,
+`ESPUINO_REMOTE_ROOT`, `ESPUINO_HTTP_USER`/`_PASSWORD`). Studio's own start
+options (`--host`, `--port`, `--no-browser`, `--no-cards`, `--no-agent`) are
+likewise overrides for one run of what the dialog saves.
 `FUNKUINO_DATA_DIR` (or `funkuino --data-dir`) points the whole installation at
 a different library folder — that is what the app configures for you.
 

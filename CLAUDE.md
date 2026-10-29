@@ -225,10 +225,13 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ./sync --host <ip>     # target a specific device
 ```
 
-Config precedence: CLI flags > `ESPUINO_*` env vars > defaults. Relevant vars:
-`ESPUINO_HOST`, `ESPUINO_LOCAL_DIR`, `ESPUINO_REMOTE_ROOT`, and
-`ESPUINO_HTTP_USER` / `ESPUINO_HTTP_PASSWORD` (only if the web UI is password
-protected). `FUNKUINO_DATA_DIR` moves the whole data folder (see *Code root vs.
+Config precedence: CLI flags > `ESPUINO_*` env vars > saved settings >
+defaults. Relevant vars: `ESPUINO_HOST`, `ESPUINO_LOCAL_DIR`,
+`ESPUINO_REMOTE_ROOT`, and `ESPUINO_HTTP_USER` / `ESPUINO_HTTP_PASSWORD` (only
+if the web UI is password protected). The saved settings are `host`,
+`remote_root` and `http_user` in `config.json` and `ESPUINO_HTTP_PASSWORD` in
+`credentials.env` — what Studio's settings dialog writes, read by
+`espuino.Config.from_env`, so every command talks to the device set up there. `FUNKUINO_DATA_DIR` moves the whole data folder (see *Code root vs.
 data root*): `FUNKUINO_DATA_DIR=/Volumes/Media/Funkuino ./cards --dry-run`.
 
 ## How the mirror works (and why)
@@ -404,8 +407,7 @@ Other flags: `--cols N`, `--card-cm F`, `--no-marks` (no cut ticks), `--no-trim`
 
 ## Funkuino Studio (`./studio`)
 
-One localhost web app (default `http://127.0.0.1:8800`; `--port`, `--host <device>`,
-`--no-browser`) covering the whole workflow, with an embedded Claude agent. Tabs:
+One localhost web app (default `http://127.0.0.1:8800`) covering the whole workflow, with an embedded Claude agent. Tabs:
 **Bibliothek** (per-card pipeline view: Download · Cover · Sync · Druck · Karte —
 the status boxes are also the actions: Sync-box uploads the unit, Druck-box
 selects for printing via a floating print bar, Karte-box assigns/unassigns RFID
@@ -413,14 +415,29 @@ cards), **Agent**, **Sync** (mirror with live log; Dry-Run always previews
 `--delete`), **Kartendruck** (the full card picker, integrated; sheets are
 `./cards --undo`-compatible).
 
-- **Optional features can be switched off at start**: `--no-cards` hides the
-  Kartendruck tab and the Druck column, `--no-agent` hides the Agent tab and the
-  Bibliothek's URL field (URL downloads run through the agent). Their
-  `/api/cards/*` and `/api/agent/*` endpoints then answer 404, and `/api/state`
-  reports both under `features`. `h_index` marks the hidden elements in the
-  served HTML, so they do not flash up before the first state arrives. The
-  flags exist on the command line only; the macOS app starts Studio without
-  them.
+- **Settings dialog** (gear in the header, `GET`/`POST /api/settings`): device
+  address, base folder on the device, HTTP login, the two optional features,
+  port and "open browser at start". Saved in `config.json` (the HTTP password
+  in `credentials.env`); a value equal to the default is removed from the file
+  rather than written. The start options — `--host`, `--port`,
+  `--browser/--no-browser`, `--cards/--no-cards`, `--agent/--no-agent` — and
+  the `ESPUINO_*` variables are **overrides for one run only**: they win over
+  the saved value, and the dialog names the flag/variable and the value in
+  force under the field, while the field itself edits the saved value.
+  Device settings and features apply live (`_apply_device_config` drops the
+  client, the cached `/info` and card assignments, rescans, and restarts the
+  device listener; refused with 409 while a sync runs); port and browser only
+  at the next start. `--host` is also exported as `ESPUINO_HOST`, so the
+  agent's `funkuino sync` targets the same device. The macOS app passes
+  `--port` and `--no-browser` (the dialog hides those two in the app) but no
+  longer `--host`, which would pin the device for the whole run; its setup
+  screen merges into `config.json` instead of rewriting it.
+- **Optional features can be switched off**: without Kartendruck the tab and
+  the Druck column are hidden, without the agent its tab and the Bibliothek's
+  URL field (URL downloads run through the agent). Their `/api/cards/*` and
+  `/api/agent/*` endpoints then answer 404, and `/api/state` reports both under
+  `features`. `h_index` marks the hidden elements in the served HTML, so they
+  do not flash up before the first state arrives.
 - **A unit = one RFID card**, derived from the `files/` naming conventions
   (album folder, Hörspiel file, `Folge N` subfolder, Lieder track). A top-level
   folder containing a **`.album` marker file** counts as an album too (used for

@@ -89,6 +89,41 @@ APP_CONFIG_DIR = Path(
 APP_CONFIG_FILE = APP_CONFIG_DIR / "config.json"
 
 
+def read_app_config() -> dict:
+    """config.json as a dict; {} when it is missing or does not parse.
+
+    The file has several writers (the macOS app's setup screen, Studio's
+    settings dialog) and several readers (this module, every command), so
+    every reader tolerates a broken or foreign file instead of failing.
+    """
+    try:
+        config = json.loads(APP_CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def update_app_config(values: dict) -> None:
+    """Merge ``values`` into config.json, keeping every other key; a value of
+    None removes its key (back to the default).
+
+    A file that exists but does not parse is left alone (ValueError) rather
+    than replaced: rewriting it would silently drop the data folder setting.
+    """
+    config: dict = {}
+    if APP_CONFIG_FILE.is_file():
+        config = json.loads(APP_CONFIG_FILE.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise ValueError("config.json is not a JSON object")
+    for key, value in values.items():
+        if value is None:
+            config.pop(key, None)
+        else:
+            config[key] = value
+    APP_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomically(APP_CONFIG_FILE, json.dumps(config, indent=2) + "\n")
+
+
 def _default_data_dir() -> Path:
     """Where a pip/pipx installation puts the library when nothing says otherwise.
 
@@ -115,11 +150,8 @@ def _resolve_data_root() -> Path:
     """
     if env := os.environ.get("FUNKUINO_DATA_DIR"):
         return Path(env).expanduser().resolve()
-    try:
-        configured = json.loads(APP_CONFIG_FILE.read_text(encoding="utf-8")).get("data_dir")
-    except (OSError, ValueError):
-        configured = None
-    if configured:
+    configured = read_app_config().get("data_dir")
+    if isinstance(configured, str) and configured:
         return Path(configured).expanduser().resolve()
     return REPO_ROOT if BUNDLED_LAYOUT else _default_data_dir()
 
@@ -141,6 +173,43 @@ def credentials_file() -> Path:
         if legacy.exists():
             return legacy
     return primary
+
+
+def parse_env(path: Path) -> dict[str, str]:
+    """Read simple ``KEY=VALUE`` lines from a .env file (no dependency)."""
+    env: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return env
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        env[key.strip()] = value.strip().strip('"').strip("'")
+    return env
+
+
+def write_env_value(path: Path, key: str, value: str | None) -> None:
+    """Set (or drop) one KEY=VALUE in a .env, leaving the other lines alone.
+
+    The file holds credentials, so it is created 0600 — it would otherwise
+    inherit a world-readable default.
+    """
+    lines = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        pass
+    kept = [ln for ln in lines
+            if not ln.strip().startswith(f"{key}=") and not ln.strip().startswith(f"{key} =")]
+    if value:
+        kept.append(f"{key}={value}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(kept).strip() + "\n", encoding="utf-8")
+    with contextlib.suppress(OSError):
+        path.chmod(0o600)
 
 
 def data_or_repo(name: str) -> Path:
@@ -460,14 +529,23 @@ class Config:
 
     @classmethod
     def from_env(cls, **overrides) -> "Config":
-        """Defaults, overlaid with ESPUINO_* env vars, then explicit (non-None)
-        keyword overrides (typically CLI arguments)."""
+        """Defaults, overlaid with the saved settings (config.json, and the
+        HTTP password from credentials.env), then ESPUINO_* env vars, then
+        explicit (non-None) keyword overrides (typically CLI arguments).
+
+        The saved settings are what Studio's settings dialog writes, so a
+        device configured there is the one `funkuino sync` talks to as well.
+        """
+        saved = {k: v for k, v in read_app_config().items() if isinstance(v, str) and v}
+        secrets = parse_env(credentials_file())
         cfg = cls(
-            host=os.environ.get("ESPUINO_HOST", DEFAULT_HOST),
+            host=os.environ.get("ESPUINO_HOST") or saved.get("host") or DEFAULT_HOST,
             local_dir=Path(os.environ.get("ESPUINO_LOCAL_DIR", str(DEFAULT_LOCAL_DIR))),
-            remote_root=os.environ.get("ESPUINO_REMOTE_ROOT", DEFAULT_REMOTE_ROOT),
-            http_user=os.environ.get("ESPUINO_HTTP_USER") or None,
-            http_password=os.environ.get("ESPUINO_HTTP_PASSWORD") or None,
+            remote_root=(os.environ.get("ESPUINO_REMOTE_ROOT")
+                         or saved.get("remote_root") or DEFAULT_REMOTE_ROOT),
+            http_user=os.environ.get("ESPUINO_HTTP_USER") or saved.get("http_user") or None,
+            http_password=(os.environ.get("ESPUINO_HTTP_PASSWORD")
+                           or secrets.get("ESPUINO_HTTP_PASSWORD") or None),
         )
         for key, value in overrides.items():
             if value is not None:

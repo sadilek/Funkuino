@@ -117,52 +117,20 @@ def find_claude_cli() -> str | None:
     return next((str(p) for p in CLI_LOCATIONS if p.is_file()), None)
 
 
-def write_env_value(path: Path, key: str, value: str | None) -> None:
-    """Set (or drop) one KEY=VALUE in a .env, leaving the other lines alone.
-
-    The token is a credential, so the file is created 0600 — it would otherwise
-    inherit a world-readable default.
-    """
-    lines = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        pass
-    kept = [ln for ln in lines
-            if not ln.strip().startswith(f"{key}=") and not ln.strip().startswith(f"{key} =")]
-    if value:
-        kept.append(f"{key}={value}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(kept).strip() + "\n", encoding="utf-8")
-    with contextlib.suppress(OSError):
-        path.chmod(0o600)
-
-
-def parse_env(path: Path) -> dict[str, str]:
-    """Read simple ``KEY=VALUE`` lines from a .env file (no dependency)."""
-    env: dict[str, str] = {}
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return env
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        env[key.strip()] = value.strip().strip('"').strip("'")
-    return env
-
-
 class Studio:
     def __init__(self, cfg: espuino.Config, token: str | None,
                  port: int = DEFAULT_PORT, cards_enabled: bool = True,
-                 agent_enabled: bool = True):
+                 agent_enabled: bool = True, open_browser: bool = True,
+                 overrides: dict[str, str] | None = None):
         self.cfg = cfg
         self.token = token
         self.port = port
-        self.cards_enabled = cards_enabled  # --no-cards: hide print tab/column, 404 its API
-        self.agent_enabled = agent_enabled  # --no-agent: hide agent tab, 404 its API
+        self.cards_enabled = cards_enabled  # off: hide print tab/column, 404 its API
+        self.agent_enabled = agent_enabled  # off: hide agent tab, 404 its API
+        self.open_browser = open_browser    # only matters at start; shown in settings
+        # Settings pinned for this run by a start parameter or an environment
+        # variable: key -> the flag/variable that pinned it (see SETTINGS).
+        self.overrides = overrides or {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.agent: studio_agent.SessionManager | None = None
 
@@ -1172,7 +1140,7 @@ class Studio:
         body = await _json_body(request)
         token = str(body.get("token") or "").strip()
         try:
-            write_env_value(espuino.APP_CONFIG_DIR / "credentials.env",
+            espuino.write_env_value(espuino.APP_CONFIG_DIR / "credentials.env",
                             "SDK_TOKEN", token or None)
         except OSError as exc:
             return web.json_response({"error": f"Konnte .env nicht schreiben: {exc}"},
@@ -1199,11 +1167,104 @@ class Studio:
         if mode not in LIBRARY_SORTS:
             return web.json_response({"error": "unbekannte Sortierung"}, status=400)
         try:
-            _set_app_config("library_sort", mode)
+            espuino.update_app_config({"library_sort": mode})
         except (OSError, ValueError) as exc:
             return web.json_response(
                 {"error": f"Konnte config.json nicht schreiben: {exc}"}, status=500)
         return web.json_response({"ok": True})
+
+    # -- settings dialog --
+    def _effective_setting(self, key: str):
+        if key in DEVICE_SETTINGS:
+            value = getattr(self.cfg, key)
+            return bool(value) if key == "http_password" else (value or "")
+        return {"cards_enabled": self.cards_enabled, "agent_enabled": self.agent_enabled,
+                "port": self.port, "open_browser": self.open_browser}[key]
+
+    def _settings_payload(self) -> dict:
+        settings = {}
+        for key in SETTINGS:
+            saved = _saved_setting(key)
+            settings[key] = {
+                "value": self._effective_setting(key),
+                "saved": bool(saved) if key == "http_password" else saved,
+                "override": self.overrides.get(key),
+            }
+        return {"settings": settings,
+                "dataDir": str(espuino.DATA_ROOT),
+                "configFile": str(espuino.APP_CONFIG_FILE)}
+
+    async def h_settings(self, request: web.Request) -> web.Response:
+        return web.json_response(self._settings_payload())
+
+    async def h_settings_save(self, request: web.Request) -> web.Response:
+        """Save settings to config.json (the HTTP password to credentials.env)
+        and apply what can be applied while running.
+
+        Device settings and the two features take effect at once, unless a
+        start parameter or environment variable pins them for this run — then
+        only the saved value changes, for the next start without it. Port and
+        browser only matter at start.
+        """
+        body = await _json_body(request)
+        try:
+            values = {key: _validate_setting(key, body[key])
+                      for key in SETTINGS if key in body}
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        device_change = any(key in DEVICE_SETTINGS and key not in self.overrides
+                            and values[key] != _saved_setting(key) for key in values)
+        if device_change and (self.sync_running or self.unit_sync_ids):
+            return web.json_response(
+                {"error": "Während eines Syncs lässt sich das Gerät nicht ändern."},
+                status=409)
+        password = values.pop("http_password", None)
+        try:
+            espuino.update_app_config(
+                {key: (None if value == SETTING_DEFAULTS[key] else value)
+                 for key, value in values.items()})
+            if password is not None:
+                espuino.write_env_value(espuino.credentials_file(),
+                                        "ESPUINO_HTTP_PASSWORD", password or None)
+        except (OSError, ValueError) as exc:
+            return web.json_response(
+                {"error": f"Konnte die Einstellungen nicht speichern: {exc}"}, status=500)
+
+        if "cards_enabled" in values and "cards_enabled" not in self.overrides:
+            self.cards_enabled = values["cards_enabled"]
+        if "agent_enabled" in values and "agent_enabled" not in self.overrides:
+            self.agent_enabled = values["agent_enabled"]
+        if device_change:
+            # Env vars (incl. a --host, see main) still win inside from_env.
+            await self._apply_device_config(espuino.Config.from_env())
+        self.emit({"t": "state.changed"})
+        return web.json_response(self._settings_payload())
+
+    async def _apply_device_config(self, cfg: espuino.Config) -> None:
+        """Switch to another device (or the same one with another base folder
+        or login) without a restart: drop the client and everything learnt from
+        the old device, and reconnect the listener."""
+        if cfg == self.cfg:
+            return
+        if self._rfid_task is not None:
+            self._rfid_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._rfid_task
+        async with self.device_lock:
+            self.cfg = cfg
+            self._client = None
+        self.device_info = None
+        self.device_reachable = False
+        self.device_attempted = False
+        self.rfid_listening = False
+        self._device_ws = None
+        self._reset_player()
+        self._assignments = None
+        self._assignments_at = None
+        self._assignment_by_id = {}
+        await self.rescan()  # the base folder maps cards and sync status to units
+        self._rfid_task = self.loop.create_task(self._rfid_listener())
+        self.loop.create_task(self.ping_device())
 
     async def h_agent_interrupt(self, request: web.Request) -> web.Response:
         guard = self._agent_ready()
@@ -1314,6 +1375,8 @@ class Studio:
         app.router.add_post("/api/rfid/assign", self.h_rfid_assign)
         app.router.add_post("/api/rfid/unassign", self.h_rfid_unassign)
         app.router.add_post("/api/prefs", self.h_prefs)
+        app.router.add_get("/api/settings", self.h_settings)
+        app.router.add_post("/api/settings", self.h_settings_save)
         app.router.add_post("/api/agent/token", self.h_agent_token)
         app.router.add_post("/api/agent/sessions", self.h_agent_create)
         app.router.add_get("/api/agent/sessions/{sid}/events", self.h_agent_events)
@@ -1328,31 +1391,80 @@ class Studio:
 
 LIBRARY_SORTS = ("date", "alpha")
 
+# What the settings dialog edits. Each is saved in config.json (the HTTP
+# password in credentials.env, with the other credentials) and can still be
+# pinned for one run by a start parameter or an environment variable — which
+# then wins, and the dialog says so. The device ones are read by every command
+# through espuino.Config, so `funkuino sync` talks to the device set up here.
+SETTINGS = {
+    "host": {"env": "ESPUINO_HOST"},
+    "remote_root": {"env": "ESPUINO_REMOTE_ROOT"},
+    "http_user": {"env": "ESPUINO_HTTP_USER"},
+    "http_password": {"env": "ESPUINO_HTTP_PASSWORD"},
+    "cards_enabled": {},
+    "agent_enabled": {},
+    "port": {},
+    "open_browser": {},
+}
+DEVICE_SETTINGS = ("host", "remote_root", "http_user", "http_password")
+SETTING_DEFAULTS = {
+    "host": espuino.DEFAULT_HOST, "remote_root": espuino.DEFAULT_REMOTE_ROOT,
+    "http_user": "", "http_password": "",
+    "cards_enabled": True, "agent_enabled": True,
+    "port": DEFAULT_PORT, "open_browser": True,
+}
+
+
+def _saved_setting(key: str):
+    """The saved value of a setting, or its default. A value of the wrong type
+    (a hand-edited config.json) counts as unset rather than failing."""
+    default = SETTING_DEFAULTS[key]
+    if key == "http_password":
+        return espuino.parse_env(espuino.credentials_file()).get(
+            "ESPUINO_HTTP_PASSWORD", "")
+    value = espuino.read_app_config().get(key)
+    if isinstance(default, bool):
+        return value if isinstance(value, bool) else default
+    if isinstance(default, int):
+        ok = isinstance(value, int) and not isinstance(value, bool)
+        return value if ok else default
+    return value if isinstance(value, str) and value else default
+
+
+def _validate_setting(key: str, value):
+    """Normalise one value from the dialog; ValueError carries the message."""
+    default = SETTING_DEFAULTS[key]
+    if isinstance(default, bool):
+        if not isinstance(value, bool):
+            raise ValueError(f"{key}: ja oder nein erwartet")
+        return value
+    if key == "port":
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("Der Port muss eine Zahl sein.") from None
+        if not 1024 <= port <= 65535:
+            raise ValueError("Der Port muss zwischen 1024 und 65535 liegen.")
+        return port
+    if not isinstance(value, str):
+        raise ValueError(f"{key}: Text erwartet")
+    if key == "http_password":
+        return value  # verbatim: spaces may be part of it; "" removes it
+    value = value.strip()
+    if key == "host":
+        # Forgive a pasted address: "http://espuino.local/" -> "espuino.local".
+        value = re.sub(r"^https?://", "", value, flags=re.I).rstrip("/")
+        if value and not re.fullmatch(r"[A-Za-z0-9.:\[\]-]+", value):
+            raise ValueError("Die Geräteadresse ist ein Name wie espuino.local "
+                             "oder eine IP-Adresse.")
+    if key == "remote_root":
+        value = "/" + value.strip("/") if value.strip("/") else ""
+    return value or default
+
 
 def _library_sort() -> str:
-    try:
-        config = json.loads(espuino.APP_CONFIG_FILE.read_text(encoding="utf-8"))
-        mode = config.get("library_sort") if isinstance(config, dict) else None
-    except (OSError, ValueError):
-        mode = None
+    mode = espuino.read_app_config().get("library_sort")
     return mode if mode in LIBRARY_SORTS else "date"
-
-
-def _set_app_config(key: str, value) -> None:
-    """Set one key in config.json, keeping the others (notably data_dir).
-
-    A file that exists but does not parse is left alone (ValueError) rather
-    than replaced: rewriting it would silently drop the data folder setting.
-    """
-    path = espuino.APP_CONFIG_FILE
-    config = {}
-    if path.is_file():
-        config = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(config, dict):
-            raise ValueError("config.json is not a JSON object")
-    config[key] = value
-    path.parent.mkdir(parents=True, exist_ok=True)
-    espuino.write_text_atomically(path, json.dumps(config, indent=2) + "\n")
 
 
 async def _json_body(request: web.Request) -> dict:
@@ -1387,38 +1499,62 @@ def main(argv: list[str] | None = None) -> int:
     if os.environ.get("FUNKUINO_EXIT_WITH_PARENT"):
         _exit_with_parent()
 
-    parser = argparse.ArgumentParser(description="Funkuino Studio web app.")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
-                        help=f"Port to bind (default {DEFAULT_PORT})")
-    parser.add_argument("--host", help="ESPuino device host/IP override")
-    parser.add_argument("--no-browser", action="store_true",
-                        help="Do not open a browser tab on start")
-    parser.add_argument("--no-cards", action="store_true",
-                        help="Hide the card-printing tab and column (feature disabled)")
-    parser.add_argument("--no-agent", action="store_true",
-                        help="Hide the agent tab (feature disabled)")
+    # Every option overrides a setting from Studio's settings dialog for this
+    # run only; without it the saved setting applies (see SETTINGS).
+    parser = argparse.ArgumentParser(
+        description="Funkuino Studio web app. Options override the saved "
+                    "settings (Studio's settings dialog) for this run.")
+    parser.add_argument("--port", type=int,
+                        help=f"Port to bind (saved setting, default {DEFAULT_PORT})")
+    parser.add_argument("--host", help="ESPuino device host/IP")
+    parser.add_argument("--browser", action=argparse.BooleanOptionalAction,
+                        help="Open a browser tab on start (saved setting, default yes)")
+    parser.add_argument("--cards", action=argparse.BooleanOptionalAction,
+                        help="Show the card-printing tab and column (saved setting, default yes)")
+    parser.add_argument("--agent", action=argparse.BooleanOptionalAction,
+                        help="Show the agent tab (saved setting, default yes)")
     args = parser.parse_args(argv)
 
-    token = parse_env(espuino.credentials_file()).get("SDK_TOKEN")
+    overrides = {key: spec["env"] for key, spec in SETTINGS.items()
+                 if spec.get("env") and os.environ.get(spec["env"])}
+    if args.host:
+        overrides["host"] = "--host"
+        # Through the environment, so the commands the agent runs
+        # (`funkuino sync`) talk to the same device as Studio does.
+        os.environ["ESPUINO_HOST"] = args.host
+    flags = {"port": ("port", "--port"), "open_browser": ("browser", "--browser"),
+             "cards_enabled": ("cards", "--cards"), "agent_enabled": ("agent", "--agent")}
+    start = {}
+    for key, (attr, flag) in flags.items():
+        value = getattr(args, attr)
+        if value is None:
+            start[key] = _saved_setting(key)
+        else:
+            start[key] = value
+            overrides[key] = flag if value is not False else flag.replace("--", "--no-", 1)
+
+    token = espuino.parse_env(espuino.credentials_file()).get("SDK_TOKEN")
     if token:
         # So the Agent SDK subprocess inherits it even if not passed explicitly.
         os.environ.setdefault("CLAUDE_CODE_OAUTH_TOKEN", token)
 
-    cfg = espuino.Config.from_env(host=args.host)
-    studio = Studio(cfg, token, port=args.port, cards_enabled=not args.no_cards,
-                    agent_enabled=not args.no_agent)
+    cfg = espuino.Config.from_env()
+    port = start["port"]
+    studio = Studio(cfg, token, port=port, cards_enabled=start["cards_enabled"],
+                    agent_enabled=start["agent_enabled"],
+                    open_browser=start["open_browser"], overrides=overrides)
     app = studio.build_app()
 
-    url = f"http://127.0.0.1:{args.port}/"
+    url = f"http://127.0.0.1:{port}/"
     print(f"Funkuino Studio at {url}"
           f"  (device: {cfg.host}, agent: {'on' if token else 'no token'})")
     if not espuino.find_ffmpeg():
         # Studio itself runs fine without it; downloading and merging do not.
         print(f"WARNING: ffmpeg not found — downloads and merging will fail.\n"
               f"         Install it with:  {espuino.ffmpeg_hint()}", file=sys.stderr)
-    if not args.no_browser:
+    if start["open_browser"]:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
-    web.run_app(app, host="127.0.0.1", port=args.port, print=None,
+    web.run_app(app, host="127.0.0.1", port=port, print=None,
                 handle_signals=True)
     return 0
 

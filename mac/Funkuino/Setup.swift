@@ -18,6 +18,19 @@ struct AppConfig: Codable, Equatable {
         case dataDir = "data_dir"
         case host
     }
+
+    init(dataDir: String, host: String) {
+        self.dataDir = dataDir
+        self.host = host
+    }
+
+    /// Studio's settings dialog drops `host` from the file when it is set
+    /// back to the default, so a missing one means exactly that.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        dataDir = try container.decode(String.self, forKey: .dataDir)
+        host = try container.decodeIfPresent(String.self, forKey: .host) ?? "espuino.local"
+    }
 }
 
 @MainActor
@@ -63,11 +76,22 @@ final class AppConfiguration: ObservableObject {
         config = exists && isDir.boolValue ? decoded : nil
     }
 
+    /// Merges into the existing file rather than replacing it: Studio keeps
+    /// its own settings there too (features, library sort, …), which a
+    /// rewrite from AppConfig alone would silently drop.
     func save(_ new: AppConfig) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(new).write(to: file, options: .atomic)
+        var merged: [String: Any] = [:]
+        if let data = try? Data(contentsOf: file),
+           let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            merged = existing
+        }
+        merged["data_dir"] = new.dataDir
+        merged["host"] = new.host
+        let data = try JSONSerialization.data(
+            withJSONObject: merged,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        try data.write(to: file, options: .atomic)
         config = new
         forceSetup = false
     }
