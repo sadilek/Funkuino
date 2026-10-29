@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "funkuino"
-version = "0.1.0"
+version = "0.2.0"
 description = "Manage an ESPuino kids' audio player: library mirroring, printable RFID cards, and a local web dashboard"
 readme = "README.md"
 license = { file = "LICENSE" }
