@@ -644,6 +644,7 @@ class Studio:
             "player": self._player,
             "tools": {"ffmpeg": self._ffmpeg_state()},
             "features": {"cards": self.cards_enabled, "agent": self.agent_enabled},
+            "prefs": {"librarySort": _library_sort()},
         })
 
     def _ffmpeg_state(self) -> dict:
@@ -1182,6 +1183,24 @@ class Studio:
         self.emit({"t": "state.changed"})
         return web.json_response({"ok": True, "available": bool(self.token)})
 
+    async def h_prefs(self, request: web.Request) -> web.Response:
+        """Store a UI preference (for now: the library sort) in config.json.
+
+        Not in the browser's localStorage: that is keyed by origin, port
+        included, and the macOS app starts Studio on a fresh port every launch,
+        so the choice would be forgotten each time.
+        """
+        body = await _json_body(request)
+        mode = body.get("librarySort")
+        if mode not in LIBRARY_SORTS:
+            return web.json_response({"error": "unbekannte Sortierung"}, status=400)
+        try:
+            _set_app_config("library_sort", mode)
+        except (OSError, ValueError) as exc:
+            return web.json_response(
+                {"error": f"Konnte config.json nicht schreiben: {exc}"}, status=500)
+        return web.json_response({"ok": True})
+
     async def h_agent_interrupt(self, request: web.Request) -> web.Response:
         guard = self._agent_ready()
         if guard is not None:
@@ -1290,6 +1309,7 @@ class Studio:
         app.router.add_get("/api/rfid/assignments", self.h_rfid_assignments)
         app.router.add_post("/api/rfid/assign", self.h_rfid_assign)
         app.router.add_post("/api/rfid/unassign", self.h_rfid_unassign)
+        app.router.add_post("/api/prefs", self.h_prefs)
         app.router.add_post("/api/agent/token", self.h_agent_token)
         app.router.add_post("/api/agent/sessions", self.h_agent_create)
         app.router.add_get("/api/agent/sessions/{sid}/events", self.h_agent_events)
@@ -1300,6 +1320,35 @@ class Studio:
         app.on_startup.append(self.on_startup)
         app.on_cleanup.append(self.on_cleanup)
         return app
+
+
+LIBRARY_SORTS = ("date", "alpha")
+
+
+def _library_sort() -> str:
+    try:
+        config = json.loads(espuino.APP_CONFIG_FILE.read_text(encoding="utf-8"))
+        mode = config.get("library_sort") if isinstance(config, dict) else None
+    except (OSError, ValueError):
+        mode = None
+    return mode if mode in LIBRARY_SORTS else "date"
+
+
+def _set_app_config(key: str, value) -> None:
+    """Set one key in config.json, keeping the others (notably data_dir).
+
+    A file that exists but does not parse is left alone (ValueError) rather
+    than replaced: rewriting it would silently drop the data folder setting.
+    """
+    path = espuino.APP_CONFIG_FILE
+    config = {}
+    if path.is_file():
+        config = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise ValueError("config.json is not a JSON object")
+    config[key] = value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    espuino.write_text_atomically(path, json.dumps(config, indent=2) + "\n")
 
 
 async def _json_body(request: web.Request) -> dict:

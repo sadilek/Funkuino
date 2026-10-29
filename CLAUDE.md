@@ -428,6 +428,14 @@ cards), **Agent**, **Sync** (mirror with live log; Dry-Run always previews
   Pipeline status comes from the existing manifests only — sync from the newest
   `status/sync-*.json`, print from `status/print-history.json`, covers from
   `card-covers/` — Studio adds no state files of its own.
+- **Library sort**: a toolbar button switches between date (groups and rows
+  newest-first, the default) and A–Z: series in German phone book order
+  (`de-u-co-phonebk`, ä = ae), numbers natural (Folge 2 before Folge 10),
+  `Folge` subfolders before single files within a series, the loose
+  "Sonstiges" group last. The choice is stored as `library_sort` in
+  `config.json` (`POST /api/prefs`, read back via `/api/state` → `prefs`), not
+  in localStorage: that is keyed by origin *including the port*, and the macOS
+  app starts Studio on a fresh port every launch.
 - **RFID assignment lives in the Bibliothek**: Studio keeps a passive, persistent
   websocket to the device (3 s `{"ping":{"ping":"ping"}}` keepalive, reconnect
   with backoff) — it hears every card placement (`{"rfidId": …}` broadcast),
