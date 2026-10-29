@@ -314,9 +314,8 @@ def write_text_atomically(path: Path, text: str) -> None:
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
-
     tmp.replace(path)
-
+    # Windows cannot open a directory to fsync it; NTFS journals the rename.
     if os.name != "nt":
         fd = os.open(path.parent, os.O_RDONLY)
         try:

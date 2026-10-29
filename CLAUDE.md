@@ -134,7 +134,8 @@ be able to take the print history with it.
 `read_json_state`): temp file + rename is only half of it — the rename can
 reach disk before the data, and a power cut then leaves an *empty* file where
 the manifest was. So the temp file is fsynced before the rename and the
-directory after it. Each run keeps one previous-good `.bak`, and a file that
+directory after it (not on Windows, which cannot open a directory; NTFS
+journals the rename). Each run keeps one previous-good `.bak`, and a file that
 does not parse is moved aside as `.corrupt-<ts>` rather than silently ignored:
 the old code started fresh and overwrote the evidence on the next save, so a
 corrupted manifest was indistinguishable from a new installation while quietly
