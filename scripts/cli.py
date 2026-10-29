@@ -24,6 +24,7 @@ which matters for sync's crash-safe manifest handling.
 """
 from __future__ import annotations
 
+import codecs
 import contextlib
 import os
 import runpy
@@ -95,7 +96,46 @@ def _run_python(args: list[str]) -> int:
     return subprocess.run(argv, env=env).returncode
 
 
+# What our own messages need beyond Latin-1 / cp1252, spelled in ASCII.
+_ASCII_FALLBACK = {"\u2014": "-", "\u2013": "-", "\u2026": "...",
+                   "\u2192": "->", "\u2190": "<-"}
+
+
+def _console_fallback(exc: UnicodeError) -> tuple[str, int]:
+    if not isinstance(exc, UnicodeEncodeError):
+        raise exc
+    text = "".join(_ASCII_FALLBACK.get(ch) or ascii(ch)[1:-1]
+                   for ch in exc.object[exc.start:exc.end])
+    return text, exc.end
+
+
+def _harden_stdio() -> None:
+    """Never crash on a character the console's charset cannot show.
+
+    stdout/stderr encode with the locale's charset. Our messages and file names
+    are full of characters Latin-1 / cp1252 lack (the em dash in half the
+    messages), and stdout's default `strict` turns each of them into a
+    UnicodeEncodeError — under `LC_ALL=de_DE.ISO8859-1`, or on Windows as soon
+    as stdout is a pipe. The charset itself is left alone: it is what the
+    terminal (or whoever reads the pipe) decodes, so switching to UTF-8 would
+    garble every umlaut it *can* show. Only the unshowable characters change,
+    to ASCII look-alikes or a `\\u…` escape. A UTF-8 stream — macOS, Linux, an
+    interactive Windows console, Studio's children — has nothing to fix, and
+    an error handler picked in PYTHONIOENCODING (`latin-1:replace`) wins.
+    """
+    if ":" in os.environ.get("PYTHONIOENCODING", ""):
+        return
+    codecs.register_error("funkuino-console", _console_fallback)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if codecs.lookup(stream.encoding).name != "utf-8":
+                stream.reconfigure(errors="funkuino-console")
+        except (AttributeError, LookupError, TypeError, ValueError):
+            pass  # None (pythonw), or replaced by something without reconfigure
+
+
 def main(argv: list[str] | None = None) -> int:
+    _harden_stdio()
     try:
         return _dispatch(argv)
     except BrokenPipeError:

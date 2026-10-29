@@ -44,7 +44,11 @@ def spoken_title(title: str) -> str:
 
 def _run(cmd: list[str]) -> None:
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        # ffmpeg writes UTF-8 whatever the locale says; `text=True` would decode
+        # it with the locale's charset and garble (or, cp1252, choke on) an
+        # error message that names a file with an umlaut.
+        res = subprocess.run(cmd, capture_output=True,
+                             encoding="utf-8", errors="replace")
     except FileNotFoundError:
         # Reached when a caller uses these helpers as a library, past main()'s
         # up-front check — still worth an instruction rather than a bare errno.
@@ -60,7 +64,7 @@ def _probe_params(mp3: Path) -> tuple[int, int]:
         ["ffprobe", "-v", "error", "-select_streams", "a:0",
          "-show_entries", "stream=sample_rate,channels",
          "-of", "default=noprint_wrappers=1:nokey=1", str(mp3)],
-        capture_output=True, text=True,
+        capture_output=True, encoding="utf-8", errors="replace",
     )
     vals = res.stdout.split()
     sr = int(vals[0]) if len(vals) >= 1 and vals[0].isdigit() else 44100
@@ -104,7 +108,7 @@ def _has_cover(mp3: Path) -> bool:
     res = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries",
          "stream=codec_type", "-of", "csv=p=0", str(mp3)],
-        capture_output=True, text=True,
+        capture_output=True, encoding="utf-8", errors="replace",
     )
     return "video" in res.stdout
 

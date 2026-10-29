@@ -440,6 +440,10 @@ class SessionManager:
             # Resolve the data folder once here instead of letting every child
             # process re-read the config file.
             "FUNKUINO_DATA_DIR": str(espuino.DATA_ROOT),
+            # The CLI reads its tools' output as UTF-8. Our commands would
+            # otherwise print in the locale's charset, and the agent would see
+            # (and pass on) garbled file names wherever that is not UTF-8.
+            "PYTHONIOENCODING": "utf-8",
         }
         if progress_file is not None:
             # ./download (and wrappers built on it) writes live progress here.

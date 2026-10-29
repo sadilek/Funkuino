@@ -259,8 +259,8 @@ def ffmpeg_status() -> dict:
         return {"path": None, "mp3": False, "hint": ffmpeg_hint()}
     mp3 = False
     try:
-        out = subprocess.run([found, "-hide_banner", "-encoders"],
-                             capture_output=True, text=True, timeout=15)
+        out = subprocess.run([found, "-hide_banner", "-encoders"], timeout=15,
+                             capture_output=True, encoding="utf-8", errors="replace")
         mp3 = "libmp3lame" in out.stdout
     except (OSError, subprocess.SubprocessError):
         pass

@@ -761,8 +761,8 @@ class Studio:
         if sys.platform != "darwin" or not pdf.exists():
             return
         try:
-            result = subprocess.run(["/usr/bin/open", str(pdf)],
-                                    capture_output=True, text=True)
+            result = subprocess.run(["/usr/bin/open", str(pdf)], capture_output=True,
+                                    encoding="utf-8", errors="replace")
             if result.returncode != 0:
                 self.emit({"t": "cards.log",
                            "line": f"Konnte {pdf.name} nicht öffnen: "
@@ -776,13 +776,17 @@ class Studio:
                 *espuino.dispatcher_argv(), *argv,
                 cwd=str(espuino.DATA_ROOT),
                 # Resolved once here so the child does not re-read the config.
-                env={**os.environ, "FUNKUINO_DATA_DIR": str(espuino.DATA_ROOT)},
+                # UTF-8 output, because that is what we decode below: left to
+                # the locale, it is Latin-1 or cp1252 on some systems, and every
+                # umlaut in a cover name arrived in the log as U+FFFD.
+                env={**os.environ, "FUNKUINO_DATA_DIR": str(espuino.DATA_ROOT),
+                     "PYTHONIOENCODING": "utf-8"},
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT)
             assert proc.stdout is not None
             sheet: Path | None = None
             async for raw in proc.stdout:
-                line = raw.decode(errors="replace").rstrip()
+                line = raw.decode("utf-8", errors="replace").rstrip()
                 # cards.py's own summary is the only handle on the file it wrote.
                 match = re.match(r"Wrote (.+\.pdf)\s", line)
                 if match:
