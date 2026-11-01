@@ -519,9 +519,13 @@ class Studio:
             e["id"]: e for e in (self._enrich_assignment(a) for a in self._assignments)
             if e["id"] is not None}
 
-    def _cards_backlog(self, units: list[dict]) -> dict:
+    def _cards_backlog(self) -> dict:
+        """Counted from the cover files on disk, like the picker grid and
+        ``./cards``, not from the cached library scan: a cover added since
+        the last rescan (an agent download, a file copied in) showed in the
+        grid while the counter still left it out."""
         _, per_page = cards.page_grid(cards.DEFAULT_CARD_CM, cards.DEFAULT_COLS)
-        new = sum(1 for u in units if u["print"] in ("new", "changed"))
+        new = sum(1 for c in self._cover_items() if c["printed"] != "printed")
         return {"newCovers": new, "perPage": per_page}
 
     # -- HTTP handlers -------------------------------------------------------
@@ -624,7 +628,7 @@ class Studio:
             "jobs": {"sync": self.sync_running, "cards": self.cards_running,
                      "unitSync": sorted(self.unit_sync_ids)},
             "agent": agent,
-            "cardsBacklog": self._cards_backlog(units),
+            "cardsBacklog": await self.loop.run_in_executor(None, self._cards_backlog),
             "rfid": {"listening": self.rfid_listening},
             "player": self._player,
             "tools": {"ffmpeg": self._ffmpeg_state()},
@@ -800,9 +804,22 @@ class Studio:
     def _cards_covers(self) -> dict:
         """All covers with printed status, newest st_birthtime first, plus
         perPage and the last print run."""
-        covers_dir = espuino.DEFAULT_COVERS_DIR
         state = PrintState.load(cards.STATE_FILE)
         _, per_page = cards.page_grid(cards.DEFAULT_CARD_CM, cards.DEFAULT_COLS)
+        items = self._cover_items(state)
+        items.sort(key=lambda d: d["birthtime"], reverse=True)
+        last = state.runs[-1] if state.runs else None
+        last_run = None if not last else {
+            "at": last.get("at"), "out": last.get("out"),
+            "count": len(last.get("changes", {}))}
+        return {"covers": items, "perPage": per_page, "lastRun": last_run}
+
+    @staticmethod
+    def _cover_items(state: PrintState | None = None) -> list[dict]:
+        """Every cover file under card-covers/ with its print status."""
+        covers_dir = espuino.DEFAULT_COVERS_DIR
+        if state is None:
+            state = PrintState.load(cards.STATE_FILE)
         items = []
         for p in cards.collect_covers(covers_dir):
             st = p.stat()
@@ -816,12 +833,7 @@ class Studio:
             items.append({"rel": rel, "printed": printed,
                           "birthtime": _creation_ts(st),
                           "size": st.st_size, "mtime": st.st_mtime})
-        items.sort(key=lambda d: d["birthtime"], reverse=True)
-        last = state.runs[-1] if state.runs else None
-        last_run = None if not last else {
-            "at": last.get("at"), "out": last.get("out"),
-            "count": len(last.get("changes", {}))}
-        return {"covers": items, "perPage": per_page, "lastRun": last_run}
+        return items
 
     async def h_cards_render(self, request: web.Request) -> web.Response:
         if not self.cards_enabled:

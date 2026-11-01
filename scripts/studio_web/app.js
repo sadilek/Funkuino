@@ -1097,13 +1097,19 @@ async function pingDevice() {
 
 /** @param {StatePayload} s */
 function renderCardsPanel(s) {
-  const b0 = s.cardsBacklog || {};
-  State.cardsBacklogEmpty = b0.newCovers === 0;
-  setCardsRunning(!!(s.jobs && s.jobs.cards));
   const b = s.cardsBacklog || {};
-  const n = b.newCovers != null ? b.newCovers : null;
+  State.cardsBacklogEmpty = b.newCovers === 0;
+  setCardsRunning(!!(s.jobs && s.jobs.cards));
+  renderBacklog(b.newCovers != null ? b.newCovers : null, b.perPage || 12);
+}
+
+/** The "noch nicht gedruckte Cover" counter. Fed by /api/state and by every
+ * cover listing, so it always counts the tiles the grid below it shows.
+ * @param {number|null} n @param {number} per */
+function renderBacklog(n, per) {
   State.cardsBacklogEmpty = n === 0;
-  const per = b.perPage || 12;
+  const print = /** @type {HTMLButtonElement|null} */ (document.getElementById("cards-print"));
+  if (print && !State.cardsRunning) print.disabled = n === 0;
   $("#backlog-num").textContent = n != null ? n : "–";
   if (n == null) {
     $("#backlog-word").textContent = "Anzahl unbekannt";
@@ -1170,6 +1176,7 @@ async function loadCovers() {
     Cards.covers = (r && r.covers) || [];
     if (r && r.perPage) Cards.perPage = r.perPage;
     Cards.loaded = true;
+    renderBacklog(Cards.covers.filter(c => c.printed !== "printed").length, Cards.perPage);
     // Drop selections whose cover no longer exists.
     const have = new Set(Cards.covers.map(c => c.rel));
     Cards.selection = Cards.selection.filter(rel => have.has(rel));
