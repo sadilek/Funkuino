@@ -34,16 +34,21 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import secrets
+import shlex
 import sys
+import tempfile
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
 import espuino
 from claude_agent_sdk import (AssistantMessage, ClaudeAgentOptions,
-                              ClaudeSDKClient, ResultMessage, SystemMessage,
+                              ClaudeSDKClient, HookMatcher, ResultMessage,
+                              SystemMessage,
                               TextBlock, ThinkingBlock, ToolResultBlock,
                               ToolUseBlock, UserMessage, get_session_info)
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
@@ -58,10 +63,20 @@ DISPATCHER = "funkuino"
 # because the permission patterns match the literal command line.
 BIN_DIR = espuino.dispatcher_bin_dir()
 
+# Read-only tools, approved outright. The SDK warns at every connect that
+# can_use_tool never sees them (CanUseToolShadowedWarning) — which is the point,
+# so that one message is silenced. Only this exact list: should an extension
+# ever allow a whole tool, the warning names it and shows up again.
+WHOLE_TOOLS = ["Read", "Glob", "Grep", "TodoWrite"]
+warnings.filterwarnings(
+    "ignore", category=UserWarning,
+    message=re.escape("can_use_tool will not be invoked for: "
+                      + ", ".join(WHOLE_TOOLS) + "."))
+
 # Bare allowlist: these are auto-approved deterministically (no classifier
 # round-trip, no card). The risky set lives in ASK_RULES instead.
 ALLOWED_TOOLS = [
-    "Read", "Glob", "Grep", "TodoWrite",
+    *WHOLE_TOOLS,
     # The dispatcher form (bin/ is on the session PATH) is what the agent is
     # told to use; the ./ wrappers stay allowed because a checkout still has
     # them and the agent may fall back to a form it saw in a shell transcript.
@@ -125,13 +140,17 @@ ALLOWED_TOOLS += _EXT_ALLOW
 # allowlisted above: an ask rule on ./cards* would shadow it anyway).
 # AskUserQuestion must be here: auto mode routes around can_use_tool, and the
 # question cards only work because can_use_tool fires for that tool.
+# rm/rmdir are not here but in _gate_rm(): a text pattern cannot tell cleaning
+# up a temp file from deleting the library, and asking for every `rm -f
+# /tmp/cover.webp` the agent tacks onto a command trained the user to click
+# "Erlauben" without reading.
 ASK_RULES = [
     "AskUserQuestion",
     # Both spellings, deliberately: missing one here does not fail loudly, it
     # silently hands the call to the auto-mode classifier, which never asks.
     "Bash(funkuino sync*)", "Bash(./sync*)",   # upload + full device listing
     "Bash(funkuino cards*)", "Bash(./cards*)",  # a real print mutates the manifest
-    "Bash(rm*)", "Bash(rmdir*)", "Bash(sudo*)",
+    "Bash(sudo*)",
     "Bash(git push*)",
 ] + _EXT_ASK
 
@@ -149,7 +168,10 @@ SYSTEM_APPEND = (
     "never a bare `python`. Never run a bare `funkuino sync` (a real "
     "upload to the device) unless the user explicitly asks for it. rm, sudo, "
     "git push, `funkuino sync` and `funkuino cards` always interrupt the user "
-    "for approval — avoid them unless genuinely needed."
+    "for approval — avoid them unless genuinely needed. So does rm/rmdir, "
+    "except of files in the temp folder (/tmp or $TMPDIR, given as an "
+    "absolute path or after `cd` into it with &&): put scratch files there, "
+    "and you may delete them freely."
 )
 
 
@@ -278,6 +300,125 @@ def _bash_head(command: str) -> str:
     if Path(parts[0]).name == DISPATCHER and len(parts) > 1:
         return f"{DISPATCHER} {parts[1]}"
     return parts[0]
+
+
+# Where the agent may delete without asking: the system's temp folders.
+# Resolved, because /tmp is a symlink to /private/tmp on macOS and a target is
+# compared after resolving its own symlinks.
+TEMP_ROOTS = tuple(dict.fromkeys(
+    os.path.realpath(p) for p in ("/tmp", "/var/tmp", tempfile.gettempdir())))
+# An rm/rmdir anywhere in a command line, as a word: counted so that one the
+# parser below did not account for (`xargs rm`, `find -exec rm`, `sh -c "rm
+# …"`, a backtick) still asks instead of slipping through.
+_RM_WORD = re.compile(r"(?<![\w./-])(?:/usr)?(?:/bin/)?(?:rm|rmdir)(?![\w.-])")
+_GLOB_ONLY = set("*?[]!.")
+
+
+def _expand_tmpdir(arg: str) -> str:
+    """$TMPDIR is the one variable worth resolving; any other stays unknown."""
+    return re.sub(r"\$\{?TMPDIR\}?", lambda _: tempfile.gettempdir(), arg)
+
+
+def _temp_path(arg: str, cwd: str | None) -> bool:
+    """Whether a path given to rm lies strictly below a temp root."""
+    arg = _expand_tmpdir(arg)
+    if "$" in arg or "`" in arg or arg.startswith("~"):
+        return False
+    if not os.path.isabs(arg):
+        if cwd is None:
+            return False
+        arg = os.path.join(cwd, arg)
+    path = os.path.realpath(arg)
+    for root in TEMP_ROOTS:
+        if path.startswith(root + os.sep):
+            first = path[len(root) + 1:].split(os.sep)[0]
+            # `rm -rf /tmp/*` would take everyone else's temp files with it.
+            return not set(first) <= _GLOB_ONLY
+    return False
+
+
+def rm_outside_temp(command: str, cwd: str) -> bool:
+    """Whether a Bash command line may delete something outside the temp
+    folders (or might, as far as can be told), so it has to ask.
+
+    Fails closed: a command it cannot parse, a target it cannot resolve, an
+    rm it did not see as a command of its own all count as outside. A `cd`
+    is followed only when the next command is joined with && — after `;`
+    or a newline a failed cd would leave rm deleting in the old folder.
+    """
+    words = len(_RM_WORD.findall(command))
+    if not words:
+        return False
+    lex = shlex.shlex(command, posix=True, punctuation_chars="();<>|&\n")
+    lex.whitespace = " \t\r"
+    lex.wordchars += "$:@%+,[]{}!^#"
+    lex.commenters = ""
+    try:
+        tokens = list(lex)
+    except ValueError:
+        return True
+
+    segments: list[tuple[list[str], str]] = []  # (words, separator after it)
+    current: list[str] = []
+    skip_next = False
+    for token in tokens:
+        if skip_next:  # the file or fd a redirection names, not an argument
+            skip_next = False
+            continue
+        if set(token) <= set("();<>|&\n"):
+            if "<" in token or ">" in token:
+                if set(token) & set(";|()\n"):
+                    return True  # `)>file` and the like: not worth guessing
+                if current and current[-1].isdigit():
+                    current.pop()  # the 2 of 2>/dev/null
+                skip_next = True
+                continue
+            segments.append((current, token))
+            current = []
+            continue
+        current.append(token)
+    segments.append((current, ""))
+
+    cwd_now: str | None = cwd
+    checked = 0
+    for argv, sep in segments:
+        head = os.path.basename(argv[0]) if argv else ""
+        if head == "cd":
+            target = _expand_tmpdir(argv[1]) if len(argv) == 2 and sep == "&&" else "$"
+            if "$" in target or target.startswith("~"):
+                cwd_now = None
+            elif os.path.isabs(target) or cwd_now:
+                cwd_now = os.path.join(cwd_now or "", target)
+        elif head in ("rm", "rmdir"):
+            paths, options = [], True
+            for arg in argv[1:]:
+                if options and arg == "--":
+                    options = False
+                elif not (options and arg.startswith("-")):
+                    paths.append(arg)
+            if not paths or not all(_temp_path(p, cwd_now) for p in paths):
+                return True
+            checked += 1
+        if ")" in sep:
+            cwd_now = None  # a cd inside a subshell ends with it
+    return checked < words
+
+
+async def _gate_rm(input_data, tool_use_id, context):
+    """PreToolUse hook: send an rm that reaches beyond the temp folders to
+    can_use_tool (a browser card), like an ask rule would. It only ever
+    escalates — an rm of temp files gets no answer here and goes on to the
+    allowlist and the auto-mode classifier like any other command, so this
+    hook cannot approve the rest of a compound command by accident."""
+    command = str((input_data.get("tool_input") or {}).get("command", ""))
+    cwd = str(input_data.get("cwd") or espuino.DATA_ROOT)
+    if not rm_outside_temp(command, cwd):
+        return {}
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "permissionDecisionReason": "Löscht Dateien außerhalb des Temp-Ordners",
+    }}
 
 
 def _pattern_for(tool_name: str, data: dict) -> str:
@@ -588,6 +729,7 @@ class SessionManager:
             setting_sources=["project"],  # load the repo CLAUDE.md, not user/local
             allowed_tools=ALLOWED_TOOLS,
             can_use_tool=can_use_tool,
+            hooks={"PreToolUse": [HookMatcher(matcher="Bash", hooks=[_gate_rm])]},
             env=env,
             resume=resume,
         )

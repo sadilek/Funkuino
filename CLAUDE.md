@@ -504,8 +504,8 @@ cards), **Agent**, **Sync** (mirror with live log; Dry-Run always previews
   guardrails. Read-only tools, the harmless commands (`funkuino download` /
   `prepare` / `covers`) and `.venv/bin/python` are allowlisted (deterministic,
   no classifier; a git-ignored `.agent-allow.json` may add machine-local
-  patterns); an explicit **ask-list** (`funkuino sync`, `funkuino cards`, `rm`,
-  `rmdir`, `sudo`, `git push` — via `--settings`
+  patterns); an explicit **ask-list** (`funkuino sync`, `funkuino cards`,
+  `sudo`, `git push` — via `--settings`
   JSON) always raises a browser permission card, because ask rules are
   evaluated *before* the mode; everything else is decided silently by the
   auto-mode classifier — it approves or **denies** (never asks; denials look
@@ -514,6 +514,22 @@ cards), **Agent**, **Sync** (mirror with live log; Dry-Run always previews
   depend on. Any sync from the agent deliberately needs approval (it would
   bypass Studio's device lock — even a dry-run does the full recursive device
   listing) and is auto-denied while a Studio sync runs.
+- **`rm`/`rmdir` are gated by a PreToolUse hook** (`_gate_rm`), not an ask
+  rule: `Bash(rm*)` raised a card for every `rm -f /tmp/cover.webp` the agent
+  tacked onto a command, so the user approved without reading. The hook parses
+  the command line (`rm_outside_temp`) and answers `"ask"` only when a target
+  may lie outside the temp folders (`/tmp`, `/var/tmp`, `$TMPDIR`; `cd /tmp &&`
+  is followed). It **only escalates, never allows**: an allow would approve the
+  rest of a compound command too; a temp-only rm falls through to the
+  allowlist and classifier. It fails closed — unparsable, `$VAR`, `~`,
+  `xargs rm`, `-exec rm`, `sh -c "rm …"`, an rm it did not see as a command of
+  its own, `rm /tmp/*` all ask. Verified live (2026-11-01, CLI 2.1.314): a hook
+  `"ask"` in auto mode reaches `can_use_tool` with the reason in
+  `context.decision_reason`; a temp rm runs with no card. Careful when testing
+  with a scratch library under `/tmp`: its files count as temp then.
+- The read-only tools in `allowed_tools` (`Read`, `Glob`, `Grep`, `TodoWrite`)
+  make the SDK print a `CanUseToolShadowedWarning` at every connect; that one
+  exact message is filtered out, since bypassing `can_use_tool` is the point.
 - **Load-bearing SDK detail** (do not "simplify" away): sessions use
   `client.connect()` with no prompt plus one `client.query()` per turn. Passing
   a finite async-generator prompt instead makes the SDK close the input stream
