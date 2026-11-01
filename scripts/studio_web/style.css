@@ -97,6 +97,15 @@ a { color: var(--accent); }
   z-index: 40;
 }
 
+/* ---------- print medium (Kartendruck toolbar) ----------
+   One control for the medium, first in the row of actions that use it: the
+   Kartendruck buttons, the cover picker there and the Bibliothek's print bar all
+   print what this names, and four selects that can disagree is the failure to
+   avoid. Sized like the buttons beside it, so the row still reads as one group. */
+.print-type { display: inline-flex; align-items: center; gap: 6px; }
+.print-type .pt-label { font-size: 12px; color: var(--ink-faint); }
+.pt-select { padding: 7px 9px; font-size: 13px; max-width: 24ch; }
+
 /* Inside Funkuino.app the window has no title bar of its own (it would repeat
    the wordmark), so the page starts at the very top and the traffic lights
    float above this header. Leave them room, and shift the wordmark clear of
