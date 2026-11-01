@@ -733,6 +733,16 @@ body.scrolled .picker-bar { box-shadow: 0 7px 8px -7px oklch(0.3 0.02 66 / .35);
   user-select: all;   /* one click selects the whole command to copy */
 }
 
+/* ---------- Update banner ----------
+   Studio was restarted onto a new frontend while this tab held something a
+   reload would lose (see unsavedWork in app.js). It goes with the reload. */
+
+.reload-banner {
+  align-items: center;
+  background: color-mix(in oklch, var(--accent) 14%, var(--surface));
+}
+.reload-banner .btn { margin-left: auto; }
+
 /* ---------- Floating print bar (Bibliothek Druck picker) ---------- */
 
 .print-bar {

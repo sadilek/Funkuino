@@ -35,7 +35,7 @@
  *   agent?: AgentState, rfid?: { listening: boolean }, player?: Player|null,
  *   tools?: { ffmpeg?: ToolState }, prefs?: { librarySort?: "date"|"alpha", printType?: string },
  *   cards?: { printTypes?: PrintType[] },
- *   cardsBacklog?: { newCovers?: number, perPage?: number } }} StatePayload
+ *   cardsBacklog?: { newCovers?: number, perPage?: number }, frontend?: string }} StatePayload
  * @typedef {{ title: string, text: string[], url: string, linkText?: string }} PrintNotice
  * @typedef {{ id: string, label: string, page?: boolean, notice?: PrintNotice|null,
  *   consented?: boolean }} PrintType
@@ -232,6 +232,7 @@ function connectWS() {
   sock.onopen = async () => {
     wsBackoff = 500;
     await refreshState();
+    checkFrontendVersion();           // a restart may have brought new files
     await replayAgentEvents();        // catch up anything missed while disconnected
   };
   sock.onmessage = (ev) => {
@@ -304,6 +305,7 @@ async function refreshState(refresh) {
     setSyncTabSpinner(!!(s.jobs && s.jobs.sync));
     renderAgentAvailability(s.agent);
     reconcileSessions(s.agent && s.agent.sessions);
+    restoreAfterReload();
     if (isTabActive("karten")) loadCovers();
   } catch (/** @type {any} */ e) {
     // Keep the app alive; surface once.
@@ -369,6 +371,132 @@ function appendLog(id, line, isErr) {
   const atBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 40;
   pane.append(el("div", { class: isErr ? "err" : null, text: String(line == null ? "" : line) }));
   if (atBottom) pane.scrollTop = pane.scrollHeight;
+}
+
+/* ----- frontend updates -----
+ * A tab left open while Studio restarts (git pull, a new app version) only
+ * reconnects its websocket; it would keep running the app.js and style.css it
+ * loaded, against a backend that may have moved on. So after a reconnect the
+ * page compares the frontend version it was served with (a <meta> h_index
+ * writes) with the one /api/state reports, and reloads itself on a mismatch.
+ * Not while the user is in the middle of something a reload would throw away:
+ * then a banner says so, and the reload waits until that is done. */
+
+const LOADED_FRONTEND =
+  document.querySelector('meta[name="funkuino-frontend"]')?.getAttribute("content") || "";
+const RELOAD_STATE_KEY = "funkuino-reload";
+let reloadWanted = false;
+/** @type {ReturnType<typeof setInterval>|undefined} */
+let reloadPoll;
+let reloadBannerKey = "";
+
+/**
+ * Everything on the page a reload would lose, as short German phrases for the
+ * banner; empty when nothing would be lost. The one place to extend when new
+ * UI state appears that only lives in this tab.
+ * @returns {string[]}
+ */
+function unsavedWork() {
+  /** @type {string[]} */
+  const open = [];
+  const typed = (/** @type {string} */ sel) => {
+    const f = /** @type {HTMLInputElement|null} */ (document.querySelector(sel));
+    return !!(f && f.value.trim());
+  };
+  if (typed("#agent-text")) open.push("die ungesendete Nachricht an den Agenten");
+  if (typed("#lib-url") || typed("#agent-url")) open.push("die eingegebene URL");
+  if (typed("#agent-token")) open.push("der eingegebene Zugangstoken");
+  if (PrintSel.size) open.push("die Druckauswahl in der Bibliothek");
+  if (Cards.selection.length) open.push("die Auswahl im Kartendruck");
+  if ($("#settings-dialog").open && Object.keys(settingsEdits()).length)
+    open.push("die geänderten Einstellungen");
+  if (questionCardsInProgress()) open.push("die angefangene Antwort an den Agenten");
+  // Closing it unanswered would put the print-medium select back on the old
+  // medium: the user's choice of the new one would be gone without a word.
+  if ($("#consent-dialog").open) open.push("die offene Frage zum Druckdienst");
+  return open;
+}
+
+/** An open question card with a choice made or an answer typed, or any
+ *  agent card whose answer is still on its way to the server. */
+function questionCardsInProgress() {
+  return $$(".act-card").some(card => {
+    if (card.querySelector(".ac-resolved")) return false;
+    if (card.querySelector(".opt-btn.sel, input[type=checkbox]:checked")) return true;
+    if ($$("input.input", card).some(i => /** @type {HTMLInputElement} */ (i).value.trim())) return true;
+    return $$("button", card).some(b => /** @type {HTMLButtonElement} */ (b).disabled);
+  });
+}
+
+function checkFrontendVersion() {
+  const served = State.data && State.data.frontend;
+  if (!served || !LOADED_FRONTEND || served === LOADED_FRONTEND) return;
+  // Reloaded for this very version and still not served it: never loop.
+  if (served === reloadedFor) return;
+  reloadWanted = true;
+  reloadWhenIdle();
+}
+
+// Reload now if nothing is open, else show why not and look again every second
+// until it is (a message sent, a selection printed or cleared, a dialog closed).
+function reloadWhenIdle() {
+  if (!reloadWanted) return;
+  const open = unsavedWork();
+  if (!open.length) { reloadNow(); return; }
+  renderReloadBanner(open);
+  if (reloadPoll === undefined) reloadPoll = setInterval(reloadWhenIdle, 1000);
+}
+
+// Keep the tab and the agent session in view across the reload; tabs have no
+// URL of their own, so the page would otherwise come back on the Bibliothek.
+function reloadNow() {
+  clearInterval(reloadPoll);
+  const tab = $$(".tab").find(b => b.classList.contains("active"));
+  try {
+    sessionStorage.setItem(RELOAD_STATE_KEY, JSON.stringify({
+      tab: tab && tab.dataset.tab, session: Agent.current,
+      target: State.data && State.data.frontend }));
+  } catch { /* storage off: the page just comes back on its first tab */ }
+  location.reload();
+}
+
+/** @type {{tab?: string, session?: string|null, target?: string}|null} */
+let pendingRestore = (() => {
+  try {
+    const raw = sessionStorage.getItem(RELOAD_STATE_KEY);
+    sessionStorage.removeItem(RELOAD_STATE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+})();
+const reloadedFor = (pendingRestore && pendingRestore.target) || "";
+
+// Called after each state refresh: the tab right away, the session once the
+// state has brought it into the list.
+function restoreAfterReload() {
+  if (!pendingRestore) return;
+  const { tab, session } = pendingRestore;
+  if (tab && !isTabActive(tab)) activateTab(tab);
+  pendingRestore = null;
+  if (session && Agent.sessions.has(session)) selectSession(session);
+}
+
+/** @param {string[]} open */
+function renderReloadBanner(open) {
+  const key = open.join("|");
+  if (key === reloadBannerKey) return;      // the button stays put under the pointer
+  reloadBannerKey = key;
+  const what = open.length === 1 ? open[0]
+    : open.slice(0, -1).join(", ") + " und " + open[open.length - 1];
+  const bar = $("#reload-banner");
+  const btn = el("button", { class: "btn", text: "Jetzt neu laden" });
+  btn.title = "Lädt sofort neu – " + what + " geht dabei verloren.";
+  btn.addEventListener("click", reloadNow);
+  bar.replaceChildren(
+    el("span", { class: "tb-what", text: "Studio wurde aktualisiert." }),
+    el("span", { text: "Die Seite lädt neu, sobald " + what
+      + (open.length === 1 ? " erledigt ist." : " erledigt sind.") }),
+    btn);
+  bar.hidden = false;
 }
 
 /* ----- settings dialog ----- */
@@ -440,13 +568,12 @@ function fillSettings() {
   $("#settings-error").hidden = true;
 }
 
-/** @param {Event} ev */
-async function saveSettings(ev) {
-  ev.preventDefault();
-  if (!settingsData) return;
-  const form = $("#settings-form");
+/** What the dialog's fields change against the saved settings. */
+function settingsEdits() {
   /** @type {Record<string, any>} */
   const body = {};
+  if (!settingsData) return body;
+  const form = $("#settings-form");
   for (const [key, st] of Object.entries(settingsData.settings)) {
     const input = form.elements.namedItem(key);
     if (!input) continue;
@@ -461,6 +588,14 @@ async function saveSettings(ev) {
     else v = input.value.trim();
     if (key === "http_password" || v !== st.saved) body[key] = v;
   }
+  return body;
+}
+
+/** @param {Event} ev */
+async function saveSettings(ev) {
+  ev.preventDefault();
+  if (!settingsData) return;
+  const body = settingsEdits();
   if (!Object.keys(body).length) { closeSettings(); return; }
   const btn = $("#settings-save");
   btn.disabled = true;

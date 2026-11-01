@@ -67,6 +67,7 @@ RFID_BACKOFF_MAX = 60.0
 RFID_ID_RE = re.compile(r"\d{12}", re.ASCII)  # card id = exactly 12 ASCII digits
 PLAYER_NO_PLAYLIST = 0    # firmware playMode when nothing is playing (values.h)
 _TRACK_PREFIX_RE = re.compile(r"^\(\d+/\d+\):\s*")  # firmware "(N/M): " title prefix
+FRONTEND_FILES = ("index.html", "style.css", "app.js")
 PLACEHOLDER = ("Studio frontend missing (scripts/studio_web/index.html). "
                "The API is up; only the UI is absent.")
 
@@ -561,6 +562,12 @@ class Studio:
                 version = (WEB_DIR / asset).stat().st_mtime_ns
                 html = html.replace(f'"/static/{asset}"',
                                     f'"/static/{asset}?v={version}"')
+        # The version of the whole frontend this page is made of, compared by
+        # app.js with /api/state's after a reconnect: a tab left open across a
+        # restart onto changed files reloads itself (see checkFrontendVersion).
+        html = html.replace(
+            "</head>",
+            f'  <meta name="funkuino-frontend" content="{_frontend_version()}">\n</head>', 1)
         return web.Response(text=html, content_type="text/html",
                             headers={"Cache-Control": "no-cache"})
 
@@ -638,6 +645,7 @@ class Studio:
             # What the printer select in the Kartendruck toolbar offers, from the
             # card_backends registry (shipped A4 sheet + any installed plugin).
             "cards": {"printTypes": await self.loop.run_in_executor(None, print_types)},
+            "frontend": _frontend_version(),
         })
 
     def _ffmpeg_state(self) -> dict:
@@ -1607,6 +1615,19 @@ def _validate_setting(key: str, value):
     if key == "remote_root":
         value = "/" + value.strip("/") if value.strip("/") else ""
     return value or default
+
+
+def _frontend_version() -> str:
+    """Names the frontend files as they are on disk now. Read per request, not
+    once at start: the files are served from disk, so a page loaded now gets
+    whatever is there now, and this has to say the same."""
+    stamps = []
+    for name in FRONTEND_FILES:
+        try:
+            stamps.append(str((WEB_DIR / name).stat().st_mtime_ns))
+        except OSError:
+            stamps.append("-")
+    return "-".join(stamps)
 
 
 def _library_sort() -> str:

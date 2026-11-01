@@ -640,7 +640,13 @@ cards), **Agent**, **Sync** (mirror with live log; Dry-Run always previews
   no-cache`. Without that, browsers cached the assets heuristically for hours:
   a new tab (Chrome) or a re-entered URL (Safari) kept the old CSS after an
   update, so a merged UI fix looked like it had not worked. A tab left open
-  across a server restart still runs its old code until reloaded.
+  across a server restart only reconnects its websocket, so it compares the
+  frontend version it was served with (`<meta name="funkuino-frontend">`,
+  the mtimes of index.html/style.css/app.js) with `/api/state` → `frontend`
+  and reloads itself on a mismatch — unless something a reload would lose is
+  open (typed message or URL, a print selection, edited settings, a question
+  card half answered, a print service's open consent dialog). Then a banner
+  holds the reload until that is done. Such state goes into `unsavedWork()` in app.js, the one place that decides.
 - Server binds 127.0.0.1 only; non-GET requests and the websocket require a
   localhost `Host`/`Origin` (CSRF guard for a localhost tool).
 - A trivial agent turn costs ~$0.27 of subscription quota (the claude_code
