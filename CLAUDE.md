@@ -577,6 +577,12 @@ cards), **Agent**, **Sync** (mirror with live log; Dry-Run always previews
   ~45 s. `on_shutdown` closes every hub socket (1001 Going Away; the tab
   reconnects with backoff to the next start) and `shutdown_timeout` is 3 s:
   jobs run as tasks, not inside requests, so nothing needs the long grace.
+- **Frontend updates reach the page.** `h_index` stamps `style.css`/`app.js`
+  with `?v=<mtime>` and every page/asset goes out with `Cache-Control:
+  no-cache`. Without that, browsers cached the assets heuristically for hours:
+  a new tab (Chrome) or a re-entered URL (Safari) kept the old CSS after an
+  update, so a merged UI fix looked like it had not worked. A tab left open
+  across a server restart still runs its old code until reloaded.
 - Server binds 127.0.0.1 only; non-GET requests and the websocket require a
   localhost `Host`/`Origin` (CSRF guard for a localhost tool).
 - A trivial agent turn costs ~$0.27 of subscription quota (the claude_code

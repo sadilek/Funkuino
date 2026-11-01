@@ -546,14 +546,26 @@ class Studio:
             html = html.replace(
                 '<span class="lib-dl">',
                 '<span class="lib-dl" hidden>')
-        return web.Response(text=html, content_type="text/html")
+        # Each asset URL names its file's version. The assets were served with
+        # no Cache-Control, so browsers cached them heuristically (for hours,
+        # going by Last-Modified) and a plain reload after an update kept the
+        # old style.css and app.js: a fix to either did not reach the page. A
+        # new URL bypasses any copy cached before, versioned or not.
+        for asset in ("style.css", "app.js"):
+            with contextlib.suppress(OSError):
+                version = (WEB_DIR / asset).stat().st_mtime_ns
+                html = html.replace(f'"/static/{asset}"',
+                                    f'"/static/{asset}?v={version}"')
+        return web.Response(text=html, content_type="text/html",
+                            headers={"Cache-Control": "no-cache"})
 
     async def h_static(self, request: web.Request) -> web.StreamResponse:
         name = request.match_info["name"]
         target = (WEB_DIR / name).resolve()
         if WEB_DIR.resolve() not in target.parents or not target.is_file():
             raise web.HTTPNotFound()
-        return web.FileResponse(target)
+        # no-cache = always revalidate (a 304 via the ETag, cheap on localhost).
+        return web.FileResponse(target, headers={"Cache-Control": "no-cache"})
 
     async def h_thumb(self, request: web.Request) -> web.StreamResponse:
         rel = request.query.get("rel", "")
