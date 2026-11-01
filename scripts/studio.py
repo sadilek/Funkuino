@@ -15,7 +15,7 @@ Design notes:
   cached last ``/info`` and a background ping refreshes it.
 * Server->client events go over one multiplexed websocket, each stamped with a
   global increasing ``seq``; agent events are also kept per session for replay
-  after a reload.
+  after a reload, and on disk so sessions outlive a restart (studio_agent).
 
 Bind is 127.0.0.1 only. The OAuth token is read from ``.env`` and handed to the
 Agent SDK via its options env -- it is never logged or returned.
@@ -148,7 +148,11 @@ class Studio:
 
         # WS hub.
         self.ws_queues: set[asyncio.Queue] = set()
-        self._seq = 0
+        # Starts at the clock (ms), not 0, so it keeps rising across restarts:
+        # agent sessions come back with the seqs of the run that logged them,
+        # and a tab left open over a restart drops every seq it thinks it has
+        # already applied. Even a sync log line per ms would not catch up.
+        self._seq = int(time.time() * 1000)
 
         # Caches.
         self._state_cache: tuple[list[dict], dict | None] | None = None
@@ -1276,6 +1280,14 @@ class Studio:
         await session.interrupt()
         return web.json_response({"ok": True})
 
+    async def h_agent_delete(self, request: web.Request) -> web.Response:
+        if not self.agent_enabled:
+            raise web.HTTPNotFound()
+        if self.agent is None or not await self.agent.remove(request.match_info["sid"]):
+            raise web.HTTPNotFound()
+        self.emit({"t": "state.changed"})  # other tabs drop it from their list
+        return web.json_response({"ok": True})
+
     # -- websocket --
     async def h_ws(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(heartbeat=30)
@@ -1305,6 +1317,7 @@ class Studio:
         self.agent = studio_agent.SessionManager(
             self.token, self.emit_agent, self.loop,
             sync_active=lambda: self.sync_running)
+        self.agent.load()
         self._ws_session = aiohttp.ClientSession()
         for stale in espuino.APP_CONFIG_DIR.glob("progress-*.json"):
             with contextlib.suppress(OSError):
@@ -1384,6 +1397,7 @@ class Studio:
         app.router.add_post("/api/agent/sessions/{sid}/answer", self.h_agent_answer)
         app.router.add_post("/api/agent/sessions/{sid}/permission", self.h_agent_permission)
         app.router.add_post("/api/agent/sessions/{sid}/interrupt", self.h_agent_interrupt)
+        app.router.add_delete("/api/agent/sessions/{sid}", self.h_agent_delete)
         app.on_startup.append(self.on_startup)
         app.on_cleanup.append(self.on_cleanup)
         return app

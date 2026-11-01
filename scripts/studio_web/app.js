@@ -25,7 +25,7 @@
  *   print?: "printed"|"changed"|"new"|"no_cover", cards?: string[] }} Unit
  * @typedef {{ host?: string, deviceId?: string, fileMtime?: number }} SyncManifest
  * @typedef {{ reachable?: boolean, host?: string|null, info?: any }} Device
- * @typedef {"running"|"waiting_user"|"waiting_input"|"done"|"error"} AgentStatus
+ * @typedef {"running"|"waiting_user"|"waiting_input"|"done"|"error"|"interrupted"} AgentStatus
  * @typedef {{ id: string, label?: string, model?: string, status?: AgentStatus, progress?: IntakeProgress|null }} SessionInfo
  * @typedef {{ sync?: boolean, cards?: boolean, unitSync?: string[] }} Jobs
  * @typedef {{ available?: boolean, reason?: string, sessions?: SessionInfo[] }} AgentState
@@ -45,7 +45,8 @@
  *   | {k:"tool",name?:string,summary?:string} | {k:"tool_result",summary?:string}
  *   | {k:"question",requestId:string,questions:Question[]}
  *   | {k:"permission",requestId:string,tool?:string,input?:any,summary?:string,pattern?:string|null}
- *   | {k:"status",status:AgentStatus} | {k:"result",costUsd?:number,turns?:number,error?:string}} AgentEvent
+ *   | {k:"status",status:AgentStatus} | {k:"result",costUsd?:number,turns?:number,error?:string}
+ *   | {k:"resolved",requestId:string,label:string,expired?:boolean} | {k:"notice",text:string}} AgentEvent
  * @typedef {(
  *   {t:"sync.log",line?:string} | {t:"sync.done",stats?:any} | {t:"sync.error",msg?:string}
  *   | {t:"cards.log",line?:string} | {t:"cards.done",code?:number}
@@ -1343,6 +1344,11 @@ function selectSession(id) {
   scrollActiveTranscript();
 }
 
+const TRASH_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none"'
+  + ' stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">'
+  + '<path d="M4 7h16M10 11v6M14 11v6M5.5 7l1 12a2 2 0 0 0 2 1.8h7a2 2 0 0 0 2-1.8l1-12M9 7V4.8A.8.8 0 0 1 9.8 4h4.4a.8.8 0 0 1 .8.8V7"/>'
+  + '</svg>';
+
 function renderSessionList() {
   const wrap = $("#session-list");
   wrap.replaceChildren();
@@ -1350,19 +1356,28 @@ function renderSessionList() {
   $("#session-empty").hidden = ids.length > 0;
   for (const id of ids) {
     const s = Agent.sessions.get(id);
-    const meta = s.ended ? "beendet" : (s.model + " · " + statusLabel(s.status));
-    wrap.append(el("button", {
-      class: "session-item" + (id === Agent.current ? " active" : "") + (s.ended ? " ended" : ""),
-      onclick: () => selectSession(id),
-    },
-      el("span", { class: "s-label", text: s.label }),
-      el("span", { class: "s-meta", text: meta })));
+    const meta = s.ended ? "gelöscht" : (s.model + " · " + statusLabel(s.status));
+    // A running session is not deletable: its CLI is mid-turn, and Stopp is
+    // the way to end that.
+    const busy = s.status === "running" || s.status === "waiting_user";
+    wrap.append(el("div", { class: "session-row" },
+      el("button", {
+        class: "session-item" + (id === Agent.current ? " active" : "") + (s.ended ? " ended" : ""),
+        onclick: () => selectSession(id),
+      },
+        el("span", { class: "s-label", text: s.label }),
+        el("span", { class: "s-meta", text: meta })),
+      s.ended || busy ? null : el("button", {
+        class: "session-del", title: "Session löschen", "aria-label": "Session löschen",
+        html: TRASH_SVG, onclick: () => deleteSession(id),
+      })));
   }
 }
 
 /** @type {Record<string, string>} */
 const STATUS_LABEL = {
   running: "läuft…", waiting_user: "wartet auf Antwort…", done: "fertig", error: "Fehler",
+  interrupted: "unterbrochen",
 };
 /** @param {string|undefined} st */
 function statusLabel(st) { return (st && STATUS_LABEL[st]) || st || ""; }
@@ -1372,7 +1387,7 @@ function renderStatus(sess) {
   const line = $("#agent-status");
   const stop = $("#agent-stop");
   if (!sess) { line.textContent = ""; stop.hidden = true; return; }
-  if (sess.ended) { line.textContent = "Session beendet. Server wurde neu gestartet."; stop.hidden = true; return; }
+  if (sess.ended) { line.textContent = "Session wurde gelöscht."; stop.hidden = true; return; }
   const running = sess.status === "running" || sess.status === "waiting_user";
   stop.hidden = !running;
   const txt = statusLabel(sess.status);
@@ -1427,6 +1442,17 @@ function applyAgentEvent(sessionId, event, seq) {
       break;
     case "permission":
       holder.append(buildPermissionCard(sess, event));
+      break;
+    case "resolved": {
+      // Server-side record of how a card ended, so a replayed card (reload,
+      // restart) does not offer buttons for a question that is long settled.
+      const card = Array.from(holder.querySelectorAll(".act-card"))
+        .find(c => c.dataset.rid === event.requestId);
+      if (card) settleCard(card, event.label || "", !!event.expired);
+      break;
+    }
+    case "notice":
+      holder.append(el("div", { class: "msg notice", text: event.text || "" }));
       break;
     case "status":
       sess.status = event.status;
@@ -1568,18 +1594,23 @@ function buildPermissionCard(sess, event) {
   return card;
 }
 
-/** @param {any} card @param {string} label */
-function resolveCard(card, label) {
+// Close a card once: by the click's own response or by the server's
+// "resolved" event, whichever comes first.
+/** @param {any} card @param {string} label @param {boolean} [expired] */
+function settleCard(card, label, expired) {
+  if (card.querySelector(".ac-resolved")) return;
   $$("button, input", card).forEach(b => { b.disabled = true; });
-  card.append(el("div", { class: "ac-resolved", text: "✓ " + label }));
+  card.classList.toggle("expired", !!expired);
+  card.append(el("div", { class: "ac-resolved", text: expired ? label : "✓ " + label }));
 }
+
+/** @param {any} card @param {string} label */
+function resolveCard(card, label) { settleCard(card, label); }
 
 // Backend rejected the resolution (already answered, or stale after interrupt/restart).
 /** @param {any} card */
 function expireCard(card) {
-  $$("button, input", card).forEach(b => { b.disabled = true; });
-  card.classList.add("expired");
-  card.append(el("div", { class: "ac-resolved", text: "Anfrage ist nicht mehr aktiv." }));
+  settleCard(card, "Anfrage ist nicht mehr aktiv.", true);
   toast("Anfrage ist nicht mehr aktiv.");
 }
 
@@ -1590,7 +1621,7 @@ async function sendAgentMessage(text) {
   text = (text || "").trim();
   if (!text || !Agent.available) return;
   const cur = Agent.current ? Agent.sessions.get(Agent.current) : null;
-  if (cur && cur.ended) { toast("Diese Session ist beendet. Starte eine neue Session."); return; }
+  if (cur && cur.ended) { toast("Diese Session wurde gelöscht. Starte eine neue Session."); return; }
   const model = $("#agent-model").value;
   try {
     if (Agent.current) {
@@ -1629,6 +1660,22 @@ async function startUrlSession(url) {
 
 /** @param {any} t */
 function looksLikeUrl(t) { return /^https?:\/\/\S+$/i.test((t || "").trim()); }
+
+// Sessions are kept across restarts, so the list only shrinks by hand: the
+// trash can on a row deletes it with its history, straight away.
+/** @param {string} id */
+async function deleteSession(id) {
+  try {
+    await api(`/api/agent/sessions/${id}`, "DELETE");
+  } catch (/** @type {any} */ e) {
+    if (e.status !== 404) { toast("Löschen fehlgeschlagen: " + e.message); return; }
+  }
+  const sess = Agent.sessions.get(id);
+  if (sess) sess.holder.remove();
+  Agent.sessions.delete(id);
+  if (Agent.current === id) selectSession(null);
+  else renderSessionList();
+}
 
 async function replayAgentEvents() {
   const ids = Array.from(Agent.sessions.keys());
@@ -1720,7 +1767,7 @@ function feedIntake(id, event) {
     case "status":
       if (event.status === "running") clearPending();
       else if (event.status === "done") finishIntake(id, false);
-      else if (event.status === "error") finishIntake(id, true);
+      else if (event.status === "error" || event.status === "interrupted") finishIntake(id, true);
       break;
     case "result":
       finishIntake(id, !!event.error);

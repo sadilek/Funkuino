@@ -13,6 +13,19 @@ The manager translates SDK messages into the compact ``agent.event`` shapes the
 frontend consumes and keeps a per-session ordered replay list (so a reloaded tab
 can catch up via ``since=``). Nothing here logs the OAuth token; it is only ever
 handed to the SDK via ``ClaudeAgentOptions.env``.
+
+Sessions survive a restart of Studio. Each one is an append-only JSON-lines log
+in ``<config dir>/agent-sessions/<id>.jsonl``: its ``{"seq", "event"}`` records
+(exactly what the replay serves) plus ``{"meta": …}`` records, of which the last
+one wins. The meta carries the Claude Code session id, so the first turn after a
+restart reconnects with ``resume=`` and the agent remembers the conversation.
+Until then a loaded session is dormant: no CLI process, nothing spent. The log
+is ours rather than a view of the CLI's transcript because that transcript is
+deleted after the CLI's cleanup period (30 days by default), and it does not
+record what the user saw: which question card was answered how, and what a turn
+cost. The config dir, not the library, because the transcripts it resumes live
+in ``~/.claude`` on this machine — a copied library could show the history but
+never continue it.
 """
 
 from __future__ import annotations
@@ -22,6 +35,8 @@ import contextlib
 import json
 import os
 import secrets
+import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -30,7 +45,7 @@ import espuino
 from claude_agent_sdk import (AssistantMessage, ClaudeAgentOptions,
                               ClaudeSDKClient, ResultMessage, SystemMessage,
                               TextBlock, ThinkingBlock, ToolResultBlock,
-                              ToolUseBlock, UserMessage)
+                              ToolUseBlock, UserMessage, get_session_info)
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
 # The command dispatcher (bin/funkuino). Sessions get its directory on PATH, so
@@ -187,6 +202,28 @@ Communicate with the user in German."""
 CHAT_PREFIX = ("[Running inside Funkuino Studio (data folder at {root}). "
                "Answer in German.]\n\n")
 
+# Shown in a session that was mid-turn when Studio stopped. Nothing resumes on
+# its own: picking a half-done download back up spends quota and touches the
+# library, so the user decides with their next message.
+INTERRUPTED_NOTICE = ("Studio wurde beendet, während der Agent arbeitete. "
+                      "Schreib eine Nachricht, um weiterzumachen.")
+FORGOTTEN_NOTICE = ("Claude hat den Verlauf dieser Session nicht mehr (Claude "
+                    "Code löscht alte Verläufe). Der Agent beginnt ohne "
+                    "Erinnerung an das Bisherige.")
+
+
+def sessions_dir() -> Path:
+    return espuino.APP_CONFIG_DIR / "agent-sessions"
+
+
+def _answer_label(answers) -> str:
+    """The 'resolved' line of a question card: what the user picked."""
+    if not isinstance(answers, dict) or not answers:
+        return "Abgebrochen"
+    picked = ["/".join(map(str, v)) if isinstance(v, list) else str(v)
+              for v in answers.values()]
+    return "Beantwortet: " + " · ".join(picked)
+
 
 def _summarize_input(tool_name: str, data: dict) -> str:
     """Compact one-line rendering of a tool call's input (Bash command, path)."""
@@ -278,10 +315,47 @@ class Session:
     worker: asyncio.Task | None = None
     progress_file: "Path | None" = None    # $FUNKUINO_PROGRESS_FILE for this session
     progress: dict | None = None            # latest intake snapshot (for reloads)
+    created: float = field(default_factory=time.time)
+    claude_session: str | None = None       # the CLI's session id, for resume=
+    log_path: "Path | None" = None          # sessions_dir()/<id>.jsonl
 
     def emit(self, event: dict) -> None:
         seq = self.manager.emit(self.id, event)
-        self.events.append({"seq": seq, "event": event})
+        record = {"seq": seq, "event": event}
+        self.events.append(record)
+        self._append(record)
+
+    # -- persistence --
+    def meta(self) -> dict:
+        return {"id": self.id, "kind": self.kind, "model": self.model,
+                "label": self.label, "created": self.created,
+                "dataDir": str(espuino.DATA_ROOT),
+                "claudeSession": self.claude_session,
+                "always": sorted(self.always)}
+
+    def save_meta(self) -> None:
+        self._append({"meta": self.meta()})
+
+    def _append(self, record: dict) -> None:
+        """One line per record, appended: a crash can only tear the last line,
+        which the loader skips. No fsync per event — losing the last few lines
+        to a power cut is acceptable for a chat history, slowing every event
+        down is not."""
+        if self.log_path is None:
+            return
+        try:
+            with self.log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except (OSError, TypeError, ValueError) as exc:
+            if not self.manager.log_warned:
+                self.manager.log_warned = True
+                print(f"warning: cannot save agent session {self.id}: {exc}",
+                      file=sys.stderr)
+
+    def _note_claude_session(self, claude_session) -> None:
+        if claude_session and claude_session != self.claude_session:
+            self.claude_session = str(claude_session)
+            self.save_meta()
 
     def set_status(self, status: str) -> None:
         self.status = status
@@ -298,6 +372,8 @@ class Session:
             self.set_status("waiting_user")
             answers = await fut
             self.pending.pop(rid, None)
+            self.emit({"k": "resolved", "requestId": rid,
+                       "label": _answer_label(answers)})
             self.set_status("running")
             # Original questions array MUST be passed back; answers keyed by
             # literal question text (see spec / SDK contract).
@@ -326,10 +402,15 @@ class Session:
         self.set_status("waiting_user")
         decision = await fut
         self.pending.pop(rid, None)
+        self.emit({"k": "resolved", "requestId": rid, "label":
+                   "Abgebrochen" if decision.get("interrupted") else
+                   "Immer erlaubt" if decision.get("allow") and decision.get("always") else
+                   "Erlaubt" if decision.get("allow") else "Abgelehnt"})
         self.set_status("running")
         if decision.get("allow"):
             if decision.get("always") and pattern is not None:
                 self.always.add(pattern)
+                self.save_meta()
             return PermissionResultAllow(updated_input=input_data)
         return PermissionResultDeny(message="Vom Nutzer abgelehnt")
 
@@ -343,6 +424,8 @@ class Session:
             self.set_status("running")
             self.emit({"k": "user", "text": echo_text})
             try:
+                if self.client is None:
+                    await self._connect()
                 await self.client.query(query_text)
                 async for msg in self.client.receive_response():
                     self._translate(msg)
@@ -352,8 +435,26 @@ class Session:
                 self.emit({"k": "result", "error": str(exc)})
                 self.set_status("error")
 
+    async def _connect(self) -> None:
+        """Start the CLI for this session: fresh, or — for a session that has
+        talked before, i.e. one loaded after a restart — resuming its Claude
+        Code conversation, so the agent knows what was said and done."""
+        resume = self.claude_session
+        if resume and not self.manager.can_resume(resume):
+            self.emit({"k": "notice", "text": FORGOTTEN_NOTICE})
+            resume = None
+        self.client = ClaudeSDKClient(options=self.manager._options(
+            self.model, self.can_use_tool, self.progress_file, resume=resume))
+        try:
+            await self.client.connect()
+        except BaseException:
+            self.client = None  # retry the connect on the next turn
+            raise
+
     def _translate(self, msg) -> None:
         if isinstance(msg, SystemMessage):
+            if msg.subtype == "init":
+                self._note_claude_session(msg.data.get("session_id"))
             return  # init/other system chatter is not shown
         if isinstance(msg, AssistantMessage):
             for block in msg.content:
@@ -371,6 +472,7 @@ class Session:
                     self.emit({"k": "tool_result",
                                "summary": _summarize_result(block)})
         elif isinstance(msg, ResultMessage):
+            self._note_claude_session(msg.session_id)
             self.emit({"k": "result", "costUsd": msg.total_cost_usd,
                        "turns": msg.num_turns,
                        "error": msg.result if msg.is_error else None})
@@ -378,6 +480,8 @@ class Session:
 
     # -- external actions (called from REST handlers on the loop) --
     def post_turn(self, query_text: str, echo_text: str) -> None:
+        if self.worker is None:
+            self.worker = self.manager.loop.create_task(self.run())
         self.queue.put_nowait((query_text, echo_text))
 
     def resolve(self, request_id: str, kind: str, value) -> bool:
@@ -390,7 +494,10 @@ class Session:
     async def interrupt(self) -> None:
         for _kind, fut in list(self.pending.values()):
             if not fut.done():
-                fut.set_result({"allow": False} if _kind == "permission" else {})
+                fut.set_result({"allow": False, "interrupted": True}
+                               if _kind == "permission" else {})
+        if self.client is None:
+            return
         try:
             await self.client.interrupt()
         except Exception:  # noqa: BLE001
@@ -405,6 +512,8 @@ class Session:
         if self.progress_file is not None:
             with contextlib.suppress(OSError):
                 self.progress_file.unlink()
+        if self.client is None:
+            return
         try:
             await self.client.disconnect()
         except Exception:  # noqa: BLE001
@@ -425,13 +534,15 @@ class SessionManager:
         # agent ./sync calls); defaults to "never busy" if not wired.
         self.sync_active = sync_active or (lambda: False)
         self.sessions: dict[str, Session] = {}
+        self.log_warned = False  # warn once, not per event, if logs can't be written
 
     @property
     def available(self) -> bool:
         return bool(self.token)
 
     def _options(self, model: str, can_use_tool,
-                 progress_file: Path | None = None) -> ClaudeAgentOptions:
+                 progress_file: Path | None = None,
+                 resume: str | None = None) -> ClaudeAgentOptions:
         env = {
             "CLAUDE_CODE_OAUTH_TOKEN": self.token,
             # Makes the bare `funkuino …` form resolvable from any cwd. Prepended,
@@ -473,7 +584,19 @@ class SessionManager:
             allowed_tools=ALLOWED_TOOLS,
             can_use_tool=can_use_tool,
             env=env,
+            resume=resume,
         )
+
+    @staticmethod
+    def can_resume(claude_session: str) -> bool:
+        """Whether the CLI still has the transcript to resume from. Resuming a
+        missing one fails the whole turn; starting fresh with a notice is the
+        better outcome."""
+        try:
+            return get_session_info(claude_session,
+                                    directory=str(espuino.DATA_ROOT)) is not None
+        except Exception:  # noqa: BLE001 - an SDK helper, never fatal here
+            return True  # let the CLI decide; its error surfaces in the turn
 
     async def create(self, kind: str, model: str,
                      url: str | None = None, text: str | None = None) -> str:
@@ -487,28 +610,105 @@ class SessionManager:
             echo_text = text or ""
             label = (text or "Chat").strip().splitlines()[0][:60] if text else "Chat"
 
-        # The can_use_tool callback is a bound method, so the session must exist
-        # before the options/client that reference it.
-        espuino.APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        progress_file = espuino.APP_CONFIG_DIR / f"progress-{sid}.json"
+        session = self._new_session(sid, kind, model, label)
         with contextlib.suppress(OSError):
-            progress_file.unlink()  # drop any stale file from a crashed run
-        session = Session(id=sid, kind=kind, model=model, label=label,
-                          manager=self, progress_file=progress_file)
-        session.client = ClaudeSDKClient(
-            options=self._options(model, session.can_use_tool, progress_file))
-        await session.client.connect()
-        session.worker = self.loop.create_task(session.run())
+            session.progress_file.unlink()  # drop any stale file from a crashed run
+        session.save_meta()
         self.sessions[sid] = session
+        # The worker connects the CLI before the first turn (the same path a
+        # session loaded after a restart takes), so a failing start shows up
+        # in the transcript rather than as a failed request.
         session.post_turn(query_text, echo_text)
         return sid
+
+    def _new_session(self, sid: str, kind: str, model: str, label: str) -> Session:
+        espuino.APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            sessions_dir().mkdir(exist_ok=True)
+        return Session(id=sid, kind=kind, model=model, label=label, manager=self,
+                       progress_file=espuino.APP_CONFIG_DIR / f"progress-{sid}.json",
+                       log_path=sessions_dir() / f"{sid}.jsonl")
+
+    def load(self) -> None:
+        """Bring back the sessions of earlier runs, dormant, oldest first.
+
+        A session of another data folder stays on disk but is not shown: its
+        conversation is about that library, and the CLI keys transcripts by
+        working directory, so it could not be resumed from this one anyway.
+        Whatever the previous run left open is closed here: question and
+        permission cards nobody can answer any more are marked as such, and a
+        session that was mid-turn says it was interrupted."""
+        loaded = []
+        for path in sessions_dir().glob("*.jsonl"):
+            meta, records = None, []
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue  # a line torn by a crash
+                if not isinstance(rec, dict):
+                    continue
+                if isinstance(rec.get("meta"), dict):
+                    meta = rec["meta"]
+                elif isinstance(rec.get("seq"), int) and isinstance(rec.get("event"), dict):
+                    records.append(rec)
+            if (not meta or meta.get("id") != path.stem
+                    or meta.get("dataDir") != str(espuino.DATA_ROOT)):
+                continue
+            session = self._new_session(
+                path.stem, str(meta.get("kind", "chat")),
+                str(meta.get("model", "sonnet")), str(meta.get("label", "Session")))
+            session.created = float(meta.get("created") or path.stat().st_mtime)
+            session.claude_session = meta.get("claudeSession")
+            session.always = set(meta.get("always") or [])
+            session.events = records
+            loaded.append(session)
+        for session in sorted(loaded, key=lambda s: s.created):
+            self.sessions[session.id] = session
+            self._settle(session)
+
+    @staticmethod
+    def _settle(session: Session) -> None:
+        open_requests: list[str] = []
+        status = "done"
+        for rec in session.events:
+            ev = rec["event"]
+            if ev.get("k") in ("question", "permission"):
+                open_requests.append(ev.get("requestId"))
+            elif ev.get("k") == "resolved":
+                with contextlib.suppress(ValueError):
+                    open_requests.remove(ev.get("requestId"))
+            elif ev.get("k") == "status":
+                status = ev.get("status", status)
+        session.status = status
+        for rid in open_requests:
+            session.emit({"k": "resolved", "requestId": rid, "expired": True,
+                          "label": "Nicht mehr aktiv (Studio wurde beendet)"})
+        if status in ("running", "waiting_user"):
+            session.emit({"k": "notice", "text": INTERRUPTED_NOTICE})
+            session.set_status("interrupted")
+
+    async def remove(self, sid: str) -> bool:
+        session = self.sessions.pop(sid, None)
+        if session is None:
+            return False
+        await session.close()
+        if session.log_path is not None:
+            with contextlib.suppress(OSError):
+                session.log_path.unlink()
+        return True
 
     def get(self, sid: str) -> Session | None:
         return self.sessions.get(sid)
 
     def summaries(self) -> list[dict]:
         return [{"id": s.id, "label": s.label, "model": s.model,
-                 "status": s.status, "progress": s.progress}
+                 "status": s.status, "progress": s.progress,
+                 "created": s.created}
                 for s in self.sessions.values()]
 
     def replay(self, sid: str, since: int) -> list[dict] | None:

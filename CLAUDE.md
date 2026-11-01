@@ -507,6 +507,19 @@ cards), **Agent**, **Sync** (mirror with live log; Dry-Run always previews
   `client.connect()` with no prompt plus one `client.query()` per turn. Passing
   a finite async-generator prompt instead makes the SDK close the input stream
   and `can_use_tool` silently never fires — questions/permissions would hang.
+- **Sessions survive a restart.** Each is an append-only log,
+  `<config dir>/agent-sessions/<id>.jsonl`: the replay events plus `{"meta"}`
+  records (last wins) holding the Claude Code session id. On start they load
+  dormant — no CLI process until the next message, which connects with
+  `resume=` so the agent remembers the conversation (if the CLI has since
+  deleted its transcript, the session starts fresh with a notice). Cards left
+  open get a `resolved` event marking them expired, and a session that was
+  mid-turn becomes `interrupted`; nothing resumes on its own. Only sessions of
+  the current data folder are shown (the CLI keys transcripts by cwd, so
+  another folder's could not be resumed). The list shrinks only by hand: the
+  trash icon (on hover, not offered while a session runs) deletes the log
+  without asking. The global ws `seq` starts at the clock in ms, so it keeps
+  rising across restarts and the restored seqs never collide with new ones.
 - Server binds 127.0.0.1 only; non-GET requests and the websocket require a
   localhost `Host`/`Origin` (CSRF guard for a localhost tool).
 - A trivial agent turn costs ~$0.27 of subscription quota (the claude_code
