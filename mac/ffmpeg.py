@@ -46,13 +46,20 @@ LAME_SHA256 = "ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e"
 # The exact surface this project uses: see prepare.py (concat demuxer, cover
 # extraction and embedding, the spoken intro's apad/aresample) and download.py
 # (yt-dlp's FFmpegExtractAudio → libmp3lame, FFmpegMetadata, thumbnails).
+# Thumbnails arrive as WebP (YouTube) or PNG as often as JPEG; covers.py and
+# prepare.make_jpg turn them into card covers.
+DECODERS = ["mp3", "mp3float", "aac", "alac", "flac", "opus", "vorbis",
+            "pcm_s16le", "pcm_s16be", "pcm_s24le", "pcm_f32le", "pcm_u8",
+            "mjpeg", "png", "webp"]
 CONFIGURE = [
     "--disable-everything", "--disable-autodetect", "--disable-doc",
     "--disable-debug", "--disable-network", "--disable-shared", "--enable-static",
     "--disable-ffplay", "--enable-ffmpeg", "--enable-ffprobe",
     "--enable-libmp3lame",
-    "--enable-decoder=mp3,mp3float,aac,alac,flac,opus,vorbis,"
-    "pcm_s16le,pcm_s16be,pcm_s24le,pcm_f32le,pcm_u8,mjpeg,png",
+    # The PNG decoder needs zlib, and --disable-autodetect stops configure from
+    # finding the system's; without this line it drops png without a word.
+    "--enable-zlib",
+    "--enable-decoder=" + ",".join(DECODERS),
     "--enable-encoder=libmp3lame,pcm_s16le,mjpeg,png",
     "--enable-demuxer=mp3,mov,ogg,matroska,wav,aiff,flac,aac,image2,concat",
     "--enable-muxer=mp3,wav,image2,ipod",
@@ -60,7 +67,7 @@ CONFIGURE = [
     "--enable-filter=aformat,anull,aresample,apad,atrim,aselect,asetnsamples,"
     "format,null,scale,copy",
     "--enable-protocol=file,pipe",
-    "--enable-bsf=null,aac_adtstoasc,extract_extradata",
+    "--enable-bsf=null,aac_adtstoasc,extract_extradata,mjpeg2jpeg",
     "--enable-swresample", "--enable-swscale",
 ]
 
@@ -127,6 +134,20 @@ def run(command: list[str], cwd: Path, env: dict | None = None) -> None:
         raise SystemExit(f"failed: {' '.join(command[:4])} …")
 
 
+def check_decoders(ffmpeg: Path) -> None:
+    """configure drops an enabled component whose dependency is missing and
+    still succeeds. That is how the first build shipped without png (and so
+    could not turn PNG thumbnails into covers), so the result is checked."""
+    listing = subprocess.run([str(ffmpeg), "-hide_banner", "-decoders"],
+                             capture_output=True, text=True, check=True).stdout
+    built = {line.split()[1] for line in listing.splitlines()
+             if len(line.split()) > 1 and line.startswith(" ")}
+    missing = [d for d in DECODERS if d not in built]
+    if missing:
+        raise SystemExit(f"configure silently dropped decoder(s): {', '.join(missing)}")
+    print(f"  decoders ok ({len(DECODERS)})")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, help="Directory to place ffmpeg/ffprobe in")
@@ -164,6 +185,8 @@ def main() -> int:
          f"--extra-cflags=-I{prefix}/include", f"--extra-ldflags=-L{prefix}/lib",
          *CONFIGURE], cwd=ffmpeg_src)
     run(["make", f"-j{args.jobs}"], cwd=ffmpeg_src)
+
+    check_decoders(ffmpeg_src / "ffmpeg")
 
     out.mkdir(parents=True, exist_ok=True)
     for tool in ("ffmpeg", "ffprobe"):

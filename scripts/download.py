@@ -92,8 +92,11 @@ def probe_flat(url: str, auth: dict) -> dict:
 
 
 def probe_full(url: str, auth: dict) -> dict:
-    """Full metadata for a single item (artist/track/album), no download."""
-    with YoutubeDL({"quiet": True, "skip_download": True, **auth}) as ydl:
+    """Full metadata for a single item (artist/track/album), no download.
+    Premium-only tracks hide their formats without cookies but not their tags;
+    the tags are all a probe needs, so a missing format is no error here."""
+    with YoutubeDL({"quiet": True, "skip_download": True,
+                    "ignore_no_formats_error": True, **auth}) as ydl:
         return ydl.extract_info(url, download=False)
 
 
@@ -159,6 +162,17 @@ def _sibling_image(mp3: Path) -> Path | None:
     return None
 
 
+def _write_cover(src: Path | None, dest: Path) -> None:
+    """Write the card cover and say where it went — or that it did not, so
+    whoever runs this (often the Studio agent) does not have to go looking."""
+    import prepare
+    if src is None:
+        print("WARNING: no cover written, the download came without a "
+              "thumbnail or embedded image")
+    elif prepare.make_jpg(src, dest, log=print):
+        print(f"cover -> {dest}")
+
+
 def _save_covers(args, lib: Path, out_dir: Path, since: float) -> None:
     """Save each freshly-downloaded track's full-res cover to covers/<rel>.jpg,
     then remove the leftover thumbnails from files/."""
@@ -168,8 +182,7 @@ def _save_covers(args, lib: Path, out_dir: Path, since: float) -> None:
             if mp3.stat().st_mtime < since - 1:
                 continue
             src = _sibling_image(mp3) or (mp3 if prepare._has_cover(mp3) else None)
-            if src:
-                prepare.make_jpg(src, espuino.cover_path_for(mp3, lib))
+            _write_cover(src, espuino.cover_path_for(mp3, lib))
     cleanup_leftovers(out_dir, since)
 
 
@@ -184,16 +197,14 @@ def _save_album_cover(args, lib: Path, out_dir: Path, since: float) -> None:
             src = _sibling_image(mp3) or (mp3 if prepare._has_cover(mp3) else None)
             if src:
                 break
-        if src:
-            prepare.make_jpg(src, espuino.cover_path_for(out_dir, lib))
+        _write_cover(src, espuino.cover_path_for(out_dir, lib))
     cleanup_leftovers(out_dir, since)
 
 
 # --- the three kinds --------------------------------------------------------
 def do_song(args, lib: Path) -> int:
     info = probe_full(args.url, _auth_opts(args))
-    artist = _safe(args.artist or _first(info, "artist", "creator", "uploader", "channel", default="Unknown"))
-    title = _safe(args.title or _first(info, "track", "title", default="Unknown"))
+    artist, title = song_names(args, info)
     out_dir = lib / (args.into or "Lieder")
     tmpl = f"{artist} - {title}".replace("%", "%%") + ".%(ext)s"
     print(f"Song -> {out_dir.name}/{artist} - {title}.mp3")
@@ -211,17 +222,22 @@ def _strip_album_prefix(title: str) -> str:
     return re.sub(r"^(?:Album|EP|Single)\s*[-–]\s*", "", title or "", flags=re.I)
 
 
-def do_album(args, flat: dict, lib: Path) -> int:
+def _probe_first(args, entries: list[dict]) -> dict:
+    return probe_full(entries[0].get("url") or entries[0]["id"], _auth_opts(args))
+
+
+def album_names(args, flat: dict, track: dict | None = None) -> tuple[str, str]:
+    """(artist, album) for an album download: the flags, else the first track's
+    tags (``track``, probed here if not given), else the playlist title."""
     entries = [e for e in (flat.get("entries") or []) if e]
-    count = flat.get("playlist_count") or len(entries) or 1
     artist = _safe(args.artist) if args.artist else ""
     album = _safe(args.album) if args.album else ""
     # A YT Music album's flat playlist carries no artist and titles itself
     # "Album - <name>"; the real artist/album live in the per-track tags. Probe
     # the first track only when a name is still missing (both flags given = no
     # extra request). Falls back to the (prefix-stripped) playlist title.
-    if (not artist or not album) and entries:
-        track = probe_full(entries[0].get("url") or entries[0]["id"], _auth_opts(args))
+    if (not artist or not album) and (track or entries):
+        track = track or _probe_first(args, entries)
         if not artist:
             artist = _safe(_first(track, "album_artist", "artist", "creator",
                                   "uploader", "channel", default="Unknown"))
@@ -232,6 +248,20 @@ def do_album(args, flat: dict, lib: Path) -> int:
         artist = "Unknown"
     if not album:
         album = _safe(_strip_album_prefix(_first(flat, "title", default="Album")))
+    return artist, album
+
+
+def song_names(args, info: dict) -> tuple[str, str]:
+    """(artist, title) for a single song: the flags, else the source's tags."""
+    artist = _safe(args.artist or _first(info, "artist", "creator", "uploader", "channel", default="Unknown"))
+    title = _safe(args.title or _first(info, "track", "title", default="Unknown"))
+    return artist, title
+
+
+def do_album(args, flat: dict, lib: Path) -> int:
+    entries = [e for e in (flat.get("entries") or []) if e]
+    count = flat.get("playlist_count") or len(entries) or 1
+    artist, album = album_names(args, flat)
     width = max(1, len(str(count)))
     out_dir = lib / f"{artist} - {album}"
     tmpl = f"%(playlist_index)0{width}d %(track,title)s.%(ext)s"
@@ -242,6 +272,53 @@ def do_album(args, flat: dict, lib: Path) -> int:
     _download(args, out_dir, tmpl)
     _save_album_cover(args, lib, out_dir, since)
     return 0
+
+
+def do_probe(args, flat: dict) -> int:
+    """Print what the intake needs to classify and name a URL, as one JSON
+    object: the playlist (title, entry titles and durations), the first track's
+    tags, and the names a plain song/album download would pick. The Studio
+    agent otherwise pieced this together from several `yt-dlp -J` pipelines."""
+    import json
+    entries = [e for e in (flat.get("entries") or []) if e]
+    is_playlist = flat.get("_type") == "playlist"
+    track = flat   # extract_flat only flattens playlists: a single is complete
+    if is_playlist:
+        try:
+            track = _probe_first(args, entries) if entries else {}
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: could not read the first track: {exc}", file=sys.stderr)
+            track = {}
+    tags = {k: track.get(k) for k in ("title", "track", "artist", "album_artist",
+                                       "album", "release_year", "channel",
+                                       "uploader", "duration")
+            if track.get(k)}
+    if track.get("description"):
+        tags["description"] = track["description"][:300]
+    out: dict = {"url": args.url, "type": "playlist" if is_playlist else "single"}
+    if is_playlist:
+        durations = [e.get("duration") for e in entries]
+        out.update({
+            "title": flat.get("title"),
+            "channel": _first(flat, "channel", "uploader") or None,
+            "count": flat.get("playlist_count") or len(entries),
+            "total_minutes": (round(sum(durations) / 60)
+                              if entries and all(durations) else None),
+            "entries": [f"{i:>3}  {_mmss(e.get('duration'))}  {e.get('title')}"
+                        for i, e in enumerate(entries, 1)],
+            "first_track": tags,
+            "album_default": "{} - {}/".format(*album_names(args, flat, track or None)),
+        })
+    else:
+        out.update({"track": tags,
+                    "song_default": "Lieder/{} - {}.mp3".format(*song_names(args, track))})
+    out = {k: v for k, v in out.items() if v is not None}
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    return 0
+
+
+def _mmss(seconds) -> str:
+    return f"{int(seconds) // 60:d}:{int(seconds) % 60:02d}" if seconds else "?:??"
 
 
 def do_audiobook(args, lib: Path) -> int:
@@ -292,6 +369,10 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("url", help="Video/playlist URL (anything yt-dlp supports)")
+    parser.add_argument("--probe", action="store_true",
+                        help="Download nothing: print the metadata needed to classify "
+                             "and name the URL (entries, first track's tags, default "
+                             "names) as JSON")
     parser.add_argument("--audiobook", action="store_true",
                         help="Hörspiel mode: merge all parts into one file with a spoken intro")
     parser.add_argument("--artist", help="Artist (song/album)")
@@ -315,6 +396,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cookies", metavar="FILE", help="Use a cookies.txt file")
     parser.add_argument("--sync", action="store_true", help="Run ./sync afterwards")
     args = parser.parse_args(argv)
+    if args.probe:   # reads metadata only, so no ffmpeg needed
+        try:
+            flat = probe_flat(args.url, _auth_opts(args))
+        except Exception as exc:  # noqa: BLE001
+            print(f"ERROR: could not read the URL: {exc}", file=sys.stderr)
+            return 1
+        return do_probe(args, flat)
     # Checked before the first network call: yt-dlp needs ffmpeg to turn what it
     # fetches into tagged MP3, so without it a long download ends in nothing.
     espuino.require_ffmpeg("convert downloaded audio to MP3")

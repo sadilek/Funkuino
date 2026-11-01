@@ -90,18 +90,32 @@ def _extract_cover(mp3: Path, dest: Path, max_px: int = MAX_COVER_PX) -> bool:
     return res.returncode == 0 and dest.exists() and dest.stat().st_size > 0
 
 
-def make_jpg(src: str | Path, dest: str | Path, max_px: int | None = None) -> bool:
+def make_jpg(src: str | Path, dest: str | Path, max_px: int | None = None,
+             log=None) -> bool:
     """Write a JPEG at ``dest`` from ``src`` (an image, or an audio file with an
     embedded cover). Optionally downscale to ``max_px``. Full resolution by
-    default (for printing). False if ``src`` has no image."""
+    default (for printing). False if ``src`` has no image; with ``log``, a
+    failure also says why (an ffmpeg without the thumbnail's decoder fails
+    here, and a silent False left the caller looking for a cover that was
+    never written)."""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     vf = ["-vf", f"scale='min({max_px},iw)':-2"] if max_px else []
     res = subprocess.run(
-        ["ffmpeg", "-y", "-i", str(src), "-an", "-frames:v", "1", *vf, "-c:v", "mjpeg", str(dest)],
-        capture_output=True,
+        ["ffmpeg", "-v", "error", "-y", "-i", str(src), "-an", "-frames:v", "1",
+         *vf, "-c:v", "mjpeg", str(dest)],
+        capture_output=True, encoding="utf-8", errors="replace",
     )
-    return res.returncode == 0 and dest.exists() and dest.stat().st_size > 0
+    if res.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+        return True
+    if log:
+        # The first error is the cause ("… no decoder found for: webp"); the
+        # rest is ffmpeg giving up on the output file.
+        reason = (res.stderr.strip().splitlines() or ["no image"])[0]
+        reason = re.sub(r"^\[[^\]]*\]\s*", "", reason)   # "[vist#0:0/webp @ 0x…] "
+        log(f"  WARNING: no cover written, ffmpeg could not convert "
+            f"{Path(src).name}: {reason}")
+    return False
 
 
 def _has_cover(mp3: Path) -> bool:
@@ -212,8 +226,11 @@ def make_audiobook(folder: str | Path, title: str, artist: str | None = None,
         parts.extend(tracks)
 
         cover_src = _find_cover_source(folder, tracks)
-        if cover_src and cover_dest:
-            if make_jpg(cover_src, cover_dest):
+        if cover_dest:
+            if not cover_src:
+                log("  WARNING: no cover written, the tracks came without a "
+                    "thumbnail or embedded image")
+            elif make_jpg(cover_src, cover_dest, log=log):
                 log(f"  cover -> {cover_dest}")
         embed = False
         cover_small = tmp / "cover.jpg"

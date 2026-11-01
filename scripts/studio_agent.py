@@ -181,7 +181,10 @@ def _system_append() -> str:
 # and auto-denied while a Studio sync job holds the device (see can_use_tool).
 
 URL_PROMPT = """The user pasted this URL into Funkuino Studio: {url}
-Handle the complete intake: probe it (yt-dlp flat probe first), classify -- \
+Handle the complete intake: probe it with `funkuino download --probe <url>` \
+(one call: playlist title, every entry with its duration, the first track's \
+tags and the default names, as JSON; Premium-only tracks need no cookies \
+for it), classify -- \
 single song / music album / Hoerspiel (audiobook) / multi-story Folge -- then \
 download with the correct wrapper invocation and flags per the project \
 instructions (CLAUDE.md and any local additions).
@@ -189,7 +192,9 @@ Before downloading, look in files/ for the series or artist this belongs to \
 and reuse its exact folder spelling, continuing its numbering (see "Matching \
 the existing library" in CLAUDE.md); ask when the match or the number is \
 unclear instead of creating a second folder.
-Verify results: naming conventions, cover placement, tags; do any needed \
+The download prints where the card cover went ("cover -> ...") or a WARNING \
+saying why there is none; take that as the cover check. \
+Verify results: naming conventions, tags; do any needed \
 renames/regrouping (multi-story Folgen per the documented convention).
 When a judgment call is needed (classification unclear, naming/attribution \
 choices, Folge number, intro wording), ask the user with the AskUserQuestion \

@@ -299,6 +299,17 @@ but intro `"Die drei Fragezeichen Kids. Panik im Paradies."`). yt-dlp cannot tel
 a Hörspiel from a music album, so `--audiobook` is explicit — the assistant
 picks it per URL. `--sync` mirrors to the device afterwards.
 
+`./download --probe <url>` downloads nothing and prints one JSON object with
+what classifying and naming needs: playlist title and count, every entry with
+its duration, the first track's tags (artist, album, release year, channel),
+and the names a plain song/album download would pick. The intake agent starts
+with it instead of hand-rolled `yt-dlp -J` pipelines (which took it three
+rounds). Probing sets `ignore_no_formats_error`, so Premium-only tracks still
+yield their tags without cookies. Every download reports its card cover:
+`cover -> <path>`, or a `WARNING` with the reason (no thumbnail, or ffmpeg
+could not convert it) — a silent miss used to send the agent digging through
+the code.
+
 **Matching the existing library.** `download.py` compares nothing: it creates
 the folder exactly as the series/artist name is passed, so `--series "Bibi &
 Tina"` next to an existing `files/Bibi und Tina/` yields a second folder (and a
@@ -730,6 +741,13 @@ mac/icon.py                      # renders the icon from the wordmark's wave mot
   copy goes first on the child's PATH, ahead of any Homebrew build. Verified
   against Homebrew's on the real pipelines (cover extract/embed/scale, concat
   with `-c copy`, the spoken intro, m4a and webm/opus decode).
+  **Thumbnails need the `webp` and `png` decoders** (YouTube serves WebP):
+  0.2.0 shipped without both — `png` needs zlib, which `--disable-autodetect`
+  hides, and configure drops a component with a missing dependency *without
+  failing* — so every download in the app lost its card cover while checkouts
+  (Homebrew ffmpeg) were fine. Hence `--enable-zlib` and `check_decoders()`,
+  which fails the build when a requested decoder did not make it in. yt-dlp's
+  `--embed-cover` conversion additionally needs the `mjpeg2jpeg` bsf.
 - **One architecture per build.** pip has to run the interpreter it installs
   into, so the runtime is single-arch and the shell is built to match — a
   universal shell would only mean an Intel Mac launches and then fails at the
