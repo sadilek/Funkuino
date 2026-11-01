@@ -431,9 +431,15 @@ body.scrolled #lib-head { box-shadow: 0 7px 8px -7px oklch(0.3 0.02 66 / .35); }
 .session-del:hover { color: var(--accent); background: var(--surface-2); }
 
 .agent-main { display: flex; flex-direction: column; min-height: 0; }
-.transcript { flex: 1; overflow: auto; padding: 4px 2px 12px; display: flex; flex-direction: column; gap: 12px; }
-.transcript-holder { display: none; flex-direction: column; height: 100%; }
+.transcript { flex: 1; overflow: auto; padding: 4px 2px 12px; }
+/* The holder grows with its content and only .transcript scrolls. It used to be
+   pinned to height: 100%, so a long transcript did not overflow it but had to
+   shrink to fit: the act cards (overflow: hidden, hence min-height 0) gave way
+   first and ended up clipped to a sliver, buttons and all, with nothing left to
+   scroll to. flex: none on the entries keeps every one at its full height. */
+.transcript-holder { display: none; flex-direction: column; gap: 12px; }
 .transcript-holder.active { display: flex; }
+.transcript-holder > * { flex: none; }
 
 .msg { max-width: 82%; }
 .msg.user { align-self: flex-end; background: var(--accent); color: var(--accent-ink); padding: 9px 13px; border-radius: 12px 12px 3px 12px; white-space: pre-wrap; }
@@ -464,6 +470,7 @@ body.scrolled #lib-head { box-shadow: 0 7px 8px -7px oklch(0.3 0.02 66 / .35); }
 .act-card.perm { border-color: color-mix(in oklch, var(--warn) 50%, var(--line)); }
 .act-card .ac-head { padding: 10px 14px; background: var(--surface-2); border-bottom: 1px solid var(--line); font-size: 12px; font-family: var(--font-mono); color: var(--ink-soft); display: flex; gap: 8px; align-items: center; }
 .act-card .ac-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
+.act-card .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .act-card .q-block { display: flex; flex-direction: column; gap: 7px; }
 .act-card .q-text { font-weight: 550; }
 .act-card .q-header { font-family: var(--font-mono); font-size: 11px; color: var(--ink-faint); text-transform: uppercase; letter-spacing: .04em; }
