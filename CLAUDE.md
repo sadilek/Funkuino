@@ -299,6 +299,24 @@ but intro `"Die drei Fragezeichen Kids. Panik im Paradies."`). yt-dlp cannot tel
 a Hörspiel from a music album, so `--audiobook` is explicit — the assistant
 picks it per URL. `--sync` mirrors to the device afterwards.
 
+**Matching the existing library.** `download.py` compares nothing: it creates
+the folder exactly as the series/artist name is passed, so `--series "Bibi &
+Tina"` next to an existing `files/Bibi und Tina/` yields a second folder (and a
+second group in Studio). So before every download, look in `files/` for what the
+new title belongs to and take over its spelling verbatim:
+
+- **Hörspiel**: a folder for the series (also with `Folge N` subfolders) → use
+  its exact name as `--series`, and pick `--number` to fit the existing Folgen
+  (the episode's real number if the source names one, not simply max + 1).
+- **Album / song**: an `<Artist> - …` folder or `Lieder/<Artist> - …` track by
+  the same artist → pass that exact spelling as `--artist`, even if the source
+  tags it differently.
+- Compare loosely (case, `&`/`und`, umlauts vs. ae/oe/ue, `???` vs.
+  `Fragezeichen`, a missing `Die`), but ask the user instead of guessing when the
+  match is ambiguous, the number collides with an existing file, or the existing
+  spelling looks wrong itself. Never rename existing folders on your own: that
+  re-uploads them and orphans their RFID card assignments.
+
 ```bash
 ./download "<song-url>"
 ./download "<album-url>" --artist "Rolf Zuckowski" --album "Meine Lieder"

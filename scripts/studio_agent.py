@@ -170,6 +170,10 @@ Handle the complete intake: probe it (yt-dlp flat probe first), classify -- \
 single song / music album / Hoerspiel (audiobook) / multi-story Folge -- then \
 download with the correct wrapper invocation and flags per the project \
 instructions (CLAUDE.md and any local additions).
+Before downloading, look in files/ for the series or artist this belongs to \
+and reuse its exact folder spelling, continuing its numbering (see "Matching \
+the existing library" in CLAUDE.md); ask when the match or the number is \
+unclear instead of creating a second folder.
 Verify results: naming conventions, cover placement, tags; do any needed \
 renames/regrouping (multi-story Folgen per the documented convention).
 When a judgment call is needed (classification unclear, naming/attribution \
