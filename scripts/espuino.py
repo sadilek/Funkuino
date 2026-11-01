@@ -481,6 +481,7 @@ IGNORE_PATTERNS = (
     "*.tmp",
     ".git",
     ".album",   # local folder-is-an-album marker; must never reach the device
+    ".__dl_*",  # a running download's work dir (download.claim_workdir)
     "*.jpg",
     "*.jpeg",
     "*.png",

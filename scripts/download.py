@@ -24,6 +24,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import sys
@@ -45,10 +46,95 @@ _LEFTOVER_EXTS = {
 }
 
 
+_UNSAFE = r'[/\\:*?"<>|\x00-\x1f]'
+_UNSAFE_CHARS = '/\\:*?"<>|'
+
+
 def _safe(name: str) -> str:
     """Filesystem-safe component; keeps umlauts/spaces, drops illegal chars."""
-    name = re.sub(r'[/\\:*?"<>|\x00-\x1f]', "_", name or "").strip(" .")
+    name = re.sub(_UNSAFE, "_", name or "").strip(" .")
     return name or "untitled"
+
+
+def _ranges(numbers: list[int]) -> str:
+    """[1, 2, 3, 5] -> '001-003, 005'."""
+    out: list[str] = []
+    for n in sorted(set(numbers)):
+        if out and n == last + 1:
+            out[-1] = out[-1].split("-")[0] + f"-{n:03d}"
+        else:
+            out.append(f"{n:03d}")
+        last = n
+    return ", ".join(out)
+
+
+def describe_target(folder: Path, lib: Path, given: str | None = None,
+                    tagged: bool = False) -> None:
+    """Say which library folder a download lands in and whether it exists, so
+    whoever runs this (often the Studio agent) need not check by hand. When
+    ``given`` holds characters a file name cannot, say that the folder spells
+    them as _ (and, if ``tagged``, that the tags keep the real name)."""
+    if given and re.search(_UNSAFE, given):
+        tags = f'; the tags keep "{given}"' if tagged else ""
+        print(f'NOTE: "{given}" is spelled "{_safe(given)}" in folder and file '
+              f'names ({_UNSAFE_CHARS} are not allowed there){tags}')
+    rel = folder.relative_to(lib).as_posix()
+    if not folder.is_dir():
+        print(f"Folder: {rel}/ -> new folder")
+        return
+    mp3s = [f for f in folder.rglob("*.mp3")
+            if not any(part.startswith(".__dl_") for part in f.relative_to(folder).parts)]
+    numbers = [int(f.name[:3]) for f in folder.glob("*.mp3")
+               if re.match(r"\d{3} - ", f.name)]
+    folgen = f" (Folgen {_ranges(numbers)})" if numbers else ""
+    print(f"Folder: {rel}/ -> existing folder, {len(mp3s)} file(s){folgen}")
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether the process that owns a work dir still runs."""
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":   # os.kill(pid, 0) would terminate it on Windows
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) \
+                and code.value == 259   # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def claim_workdir(parent: Path, key: str) -> tuple[Path, list[int]]:
+    """Create this process's work dir ``parent/.__dl_<key>_<pid>__`` and return
+    it with the pids of other live runs holding the same key. Work dirs of runs
+    that died (SIGTERM, a power cut: no ``finally`` ran) are removed here.
+
+    The own dir is created *before* looking for others, so of two runs that
+    start at the same moment at least one sees the other — never neither."""
+    work = parent / f".__dl_{key}_{os.getpid()}__"
+    work.mkdir(parents=True, exist_ok=True)
+    busy: list[int] = []
+    pattern = re.compile(rf"\.__dl_{re.escape(key)}_(\d+)__")
+    for other in parent.iterdir():
+        match = pattern.fullmatch(other.name)
+        if not match or other == work:
+            continue
+        if _pid_alive(int(match.group(1))):
+            busy.append(int(match.group(1)))
+        else:
+            shutil.rmtree(other, ignore_errors=True)
+    return work, busy
 
 
 def _first(info: dict, *keys: str, default: str = "") -> str:
@@ -173,19 +259,6 @@ def _write_cover(src: Path | None, dest: Path) -> None:
         print(f"cover -> {dest}")
 
 
-def _save_covers(args, lib: Path, out_dir: Path, since: float) -> None:
-    """Save each freshly-downloaded track's full-res cover to covers/<rel>.jpg,
-    then remove the leftover thumbnails from files/."""
-    import prepare
-    if not args.no_cover:
-        for mp3 in sorted(out_dir.glob("*.mp3")):
-            if mp3.stat().st_mtime < since - 1:
-                continue
-            src = _sibling_image(mp3) or (mp3 if prepare._has_cover(mp3) else None)
-            _write_cover(src, espuino.cover_path_for(mp3, lib))
-    cleanup_leftovers(out_dir, since)
-
-
 def _save_album_cover(args, lib: Path, out_dir: Path, since: float) -> None:
     """An album is a single RFID card (the whole folder plays as one playlist),
     so save ONE title image for the folder — not one per track — at
@@ -203,16 +276,47 @@ def _save_album_cover(args, lib: Path, out_dir: Path, since: float) -> None:
 
 # --- the three kinds --------------------------------------------------------
 def do_song(args, lib: Path) -> int:
+    """Download into a work dir of this process and move the MP3 to Lieder/
+    only at the end: Lieder/ is shared by every song, so a parallel run must
+    not see (or clean up) this run's partials and thumbnails, nor this run
+    theirs."""
+    import prepare
     info = probe_full(args.url, _auth_opts(args))
     artist, title = song_names(args, info)
     out_dir = lib / (args.into or "Lieder")
-    tmpl = f"{artist} - {title}".replace("%", "%%") + ".%(ext)s"
-    print(f"Song -> {out_dir.name}/{artist} - {title}.mp3")
-    since = time.time()
+    target = out_dir / f"{artist} - {title}.mp3"
+    print(f"Song -> {out_dir.name}/{target.name}")
+    describe_target(out_dir, lib, args.artist)
+    if target.exists():
+        print(f"ERROR: {target.relative_to(lib)} already exists. Pick another "
+              "--title, or remove the existing file first to replace it.",
+              file=sys.stderr)
+        return 1
+    tmpl = target.stem.replace("%", "%%") + ".%(ext)s"
+    work, _ = claim_workdir(out_dir, "song")
     PROGRESS.phase("download")
     PROGRESS.item(1, 1, title)
-    _download(args, out_dir, tmpl)
-    _save_covers(args, lib, out_dir, since)
+    try:
+        _download(args, work, tmpl)
+        mp3s = sorted(work.glob("*.mp3"))
+        if not mp3s:
+            print("ERROR: nothing was downloaded. If the source needs a "
+                  "logged-in account, retry with --cookies-from-browser "
+                  "<browser> (see yt-dlp docs).", file=sys.stderr)
+            return 1
+        for mp3 in mp3s:
+            dest = out_dir / mp3.name
+            if dest.exists():   # a parallel run finished the same song first
+                print(f"ERROR: {dest.relative_to(lib)} appeared while "
+                      "downloading (another run?); kept that one.", file=sys.stderr)
+                return 1
+            image = _sibling_image(mp3)
+            mp3.replace(dest)
+            if not args.no_cover:
+                src = image or (dest if prepare._has_cover(dest) else None)
+                _write_cover(src, espuino.cover_path_for(dest, lib))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     return 0
 
 
@@ -266,6 +370,7 @@ def do_album(args, flat: dict, lib: Path) -> int:
     out_dir = lib / f"{artist} - {album}"
     tmpl = f"%(playlist_index)0{width}d %(track,title)s.%(ext)s"
     print(f"Album -> {out_dir.name}/  ({count} tracks, index width {width})")
+    describe_target(out_dir, lib, " - ".join(filter(None, (args.artist, args.album))))
     since = time.time()
     PROGRESS.phase("download")
     PROGRESS.item(0, count, "")
@@ -329,29 +434,35 @@ def do_audiobook(args, lib: Path) -> int:
 
     folge = f"{int(args.number):03d}"
     series_dir = lib / _safe(args.series)
-    work = series_dir / f".__dl_{folge}__"          # isolated from other episodes
     output = series_dir / f"{folge} - {_safe(args.title)}.mp3"
     intro = args.intro or prepare.spoken_title(f"{args.series} - {args.title}")
 
     print(f"Hörspiel -> {series_dir.name}/{output.name}   intro: {intro!r}")
-    PROGRESS.phase("download")
-    _download(args, work, "%(playlist_index)03d %(title)s.%(ext)s")
-
-    tracks = list(work.glob("*.mp3"))
-    if not tracks:
-        shutil.rmtree(work, ignore_errors=True)
-        try:
-            series_dir.rmdir()  # only if we just created it and it's empty
-        except OSError:
-            pass
-        print("ERROR: no tracks were downloaded — nothing to merge. If the "
-              "source needs a logged-in account, retry with "
-              "--cookies-from-browser <browser> (see yt-dlp docs).",
-              file=sys.stderr)
+    describe_target(series_dir, lib, args.series, tagged=True)
+    taken = sorted(series_dir.glob(f"{folge} - *.mp3"))
+    if taken:
+        print(f"ERROR: Folge {folge} is taken: {taken[0].relative_to(lib)}. "
+              "Choose another --number (ask if unsure), or remove the existing "
+              "file first to replace it.", file=sys.stderr)
         return 1
-
-    PROGRESS.phase("merge")
+    # One work dir per process, keyed by the Folge: a second run of the same
+    # number would end in the same output file, so it stops here instead.
+    work, busy = claim_workdir(series_dir, folge)
     try:
+        if busy:
+            print(f"ERROR: Folge {folge} of {series_dir.name} is being downloaded "
+                  f"by another run right now (pid {busy[0]}). Choose another "
+                  "--number, or wait for that run.", file=sys.stderr)
+            return 1
+        PROGRESS.phase("download")
+        _download(args, work, "%(playlist_index)03d %(title)s.%(ext)s")
+        if not list(work.glob("*.mp3")):
+            print("ERROR: no tracks were downloaded — nothing to merge. If the "
+                  "source needs a logged-in account, retry with "
+                  "--cookies-from-browser <browser> (see yt-dlp docs).",
+                  file=sys.stderr)
+            return 1
+        PROGRESS.phase("merge")
         prepare.make_audiobook(
             work, title=args.title, artist=args.series, album=args.series,
             intro=intro, output=output, tts=not args.no_tts, quality=args.quality,
@@ -360,6 +471,10 @@ def do_audiobook(args, lib: Path) -> int:
         )
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        try:
+            series_dir.rmdir()  # only if we just created it and it's empty
+        except OSError:
+            pass
     return 0
 
 
@@ -396,6 +511,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cookies", metavar="FILE", help="Use a cookies.txt file")
     parser.add_argument("--sync", action="store_true", help="Run ./sync afterwards")
     args = parser.parse_args(argv)
+    # Piped (the Studio agent's Bash tool), stdout is block-buffered and an
+    # ERROR on stderr would show up before the lines that lead to it.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     if args.probe:   # reads metadata only, so no ffmpeg needed
         try:
             flat = probe_flat(args.url, _auth_opts(args))

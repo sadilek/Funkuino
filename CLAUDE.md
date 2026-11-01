@@ -327,6 +327,30 @@ new title belongs to and take over its spelling verbatim:
   match is ambiguous, the number collides with an existing file, or the existing
   spelling looks wrong itself. Never rename existing folders on your own: that
   re-uploads them and orphans their RFID card assignments.
+- **A `_` in a folder name is a character file names cannot hold.**
+  `download._safe()` turns `/\:*?"<>|` into `_`, so the series *Die drei ???
+  Kids* lives in `files/Die drei ___ Kids/`. Always pass the real spelling
+  (`--series "Die drei ??? Kids"`): the folder comes out the same, and the
+  name also goes into the artist/album tags, which keep the `???`. Never
+  pass the `_` folder name as `--series`/`--artist`: the tags would then
+  read `Die drei ___ Kids`.
+
+Every download prints its target before it starts: `Folder: <path>/ -> new
+folder` or `-> existing folder, N file(s) (Folgen 001-003)`, plus a `NOTE:`
+when the given name was respelled for the folder. So the agent need not list
+the folder or read the code to check where a download lands.
+
+**Parallel downloads** (several Studio sessions at once) do not touch each
+other's files. A song and a Hörspiel download into a work dir of their own,
+`<target folder>/.__dl_<key>_<pid>__/` (in `espuino.IGNORE_PATTERNS`, so sync
+and Studio skip it), and only the finished MP3 is moved into place; a work dir
+whose process is gone is removed by the next run. Neither overwrites: a
+Hörspiel stops before downloading when its Folge number is taken
+(`NNN - *.mp3` exists, whatever the title) or another run is downloading the
+same number right now, a song when `Lieder/<Artist> - <Title>.mp3` exists —
+each with an `ERROR:` naming the file. The number then is the user's call.
+Albums still download straight into their folder; two runs of the *same*
+album would collide, different albums do not.
 
 ```bash
 ./download "<song-url>"

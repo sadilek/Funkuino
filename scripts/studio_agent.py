@@ -174,6 +174,15 @@ SYSTEM_APPEND = (
     "and you may delete them freely."
 )
 
+# Where the scripts live. Not REPO_ROOT: in a pip install that is
+# site-packages, while the modules sit in its funkuino/ package. Without this
+# the agent looked for scripts/download.py in the data folder first, then asked
+# `funkuino python` for REPO_ROOT.
+CODE_DIR = Path(espuino.__file__).resolve().parent
+CODE_NOTE = ("The project's code (download.py, prepare.py, …) is in {code}: "
+             "read-only, and normally not needed, since CLAUDE.md describes "
+             "what the commands do. It is not in the data folder.")
+
 
 def _system_append() -> str:
     """SYSTEM_APPEND plus the project instructions the session needs.
@@ -188,7 +197,7 @@ def _system_append() -> str:
     A git-ignored ``CLAUDE.local.md`` is appended either way — machine-local
     tooling knowledge that must not touch the repo's CLAUDE.md.
     """
-    parts = [SYSTEM_APPEND]
+    parts = [SYSTEM_APPEND, CODE_NOTE.format(code=CODE_DIR)]
     if espuino.DATA_ROOT != espuino.REPO_ROOT:
         knowledge = espuino.knowledge_file()
         if knowledge:
@@ -211,11 +220,14 @@ single song / music album / Hoerspiel (audiobook) / multi-story Folge -- then \
 download with the correct wrapper invocation and flags per the project \
 instructions (CLAUDE.md and any local additions).
 Before downloading, look in files/ for the series or artist this belongs to \
-and reuse its exact folder spelling, continuing its numbering (see "Matching \
-the existing library" in CLAUDE.md); ask when the match or the number is \
+and reuse its exact spelling, continuing its numbering (see "Matching \
+the existing library" in CLAUDE.md) -- but a _ in a folder name stands for a \
+character file names cannot hold (e.g. ???): pass the real name, the folder \
+comes out the same. Ask when the match or the number is \
 unclear instead of creating a second folder.
-The download prints where the card cover went ("cover -> ...") or a WARNING \
-saying why there is none; take that as the cover check. \
+The download prints its target folder (new, or existing with how many files \
+and Folgen) and where the card cover went ("cover -> ...") or a WARNING \
+saying why there is none; take that as the folder and cover check. \
 Verify results: naming conventions, tags; do any needed \
 renames/regrouping (multi-story Folgen per the documented convention).
 When a judgment call is needed (classification unclear, naming/attribution \
@@ -226,8 +238,8 @@ approves; you may \
 suggest it at the end. Report a concise German summary of what landed where.
 Communicate with the user in German."""
 
-CHAT_PREFIX = ("[Running inside Funkuino Studio (data folder at {root}). "
-               "Answer in German.]\n\n")
+CHAT_PREFIX = ("[Running inside Funkuino Studio (data folder at {root}, "
+               "code at {code}). Answer in German.]\n\n")
 
 # Shown in a session that was mid-turn when Studio stopped. Nothing resumes on
 # its own: picking a half-done download back up spends quota and touches the
@@ -753,7 +765,7 @@ class SessionManager:
             echo_text = url or ""
             label = (url or "URL")[:60]
         else:
-            query_text = CHAT_PREFIX.format(root=espuino.DATA_ROOT) + (text or "")
+            query_text = CHAT_PREFIX.format(root=espuino.DATA_ROOT, code=CODE_DIR) + (text or "")
             echo_text = text or ""
             label = (text or "Chat").strip().splitlines()[0][:60] if text else "Chat"
 
