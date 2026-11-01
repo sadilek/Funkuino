@@ -43,7 +43,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 import requests
-from aiohttp import web
+from aiohttp import WSCloseCode, web
 
 import cards
 import espuino
@@ -148,6 +148,7 @@ class Studio:
 
         # WS hub.
         self.ws_queues: set[asyncio.Queue] = set()
+        self.ws_clients: set[web.WebSocketResponse] = set()  # closed on shutdown
         # Starts at the clock (ms), not 0, so it keeps rising across restarts:
         # agent sessions come back with the seqs of the run that logged them,
         # and a tab left open over a restart drops every seq it thinks it has
@@ -1301,10 +1302,12 @@ class Studio:
                 await ws.send_json(msg)
 
         wtask = self.loop.create_task(writer())
+        self.ws_clients.add(ws)
         try:
             async for _ in ws:  # client sends nothing; just detect close
                 pass
         finally:
+            self.ws_clients.discard(ws)
             wtask.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await wtask
@@ -1326,6 +1329,16 @@ class Studio:
         self.loop.create_task(self.ping_device())     # populate device chip in bg
         self._rfid_task = self.loop.create_task(self._rfid_listener())
         self._intake_task = self.loop.create_task(self._intake_poller())
+
+    async def on_shutdown(self, app: web.Application) -> None:
+        # An open tab's /ws handler only returns once the socket closes, and
+        # aiohttp waits for running handlers (up to shutdown_timeout) before it
+        # lets the process exit — so close them ourselves. The tab reconnects
+        # with backoff to whatever Studio starts next.
+        await asyncio.gather(
+            *(ws.close(code=WSCloseCode.GOING_AWAY, message=b"Studio stopped")
+              for ws in list(self.ws_clients)),
+            return_exceptions=True)
 
     async def on_cleanup(self, app: web.Application) -> None:
         self._shutting_down = True
@@ -1399,6 +1412,7 @@ class Studio:
         app.router.add_post("/api/agent/sessions/{sid}/interrupt", self.h_agent_interrupt)
         app.router.add_delete("/api/agent/sessions/{sid}", self.h_agent_delete)
         app.on_startup.append(self.on_startup)
+        app.on_shutdown.append(self.on_shutdown)
         app.on_cleanup.append(self.on_cleanup)
         return app
 
@@ -1568,8 +1582,10 @@ def main(argv: list[str] | None = None) -> int:
               f"         Install it with:  {espuino.ffmpeg_hint()}", file=sys.stderr)
     if start["open_browser"]:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    # Jobs run as tasks, not inside requests, so nothing legitimate needs
+    # aiohttp's default 60 s grace; a slow device call must not hold the exit.
     web.run_app(app, host="127.0.0.1", port=port, print=None,
-                handle_signals=True)
+                handle_signals=True, shutdown_timeout=3)
     return 0
 
 

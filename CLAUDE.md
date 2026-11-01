@@ -520,6 +520,12 @@ cards), **Agent**, **Sync** (mirror with live log; Dry-Run always previews
   trash icon (on hover, not offered while a session runs) deletes the log
   without asking. The global ws `seq` starts at the clock in ms, so it keeps
   rising across restarts and the restored seqs never collide with new ones.
+- **Stopping is immediate, tabs or not.** aiohttp waits for running handlers
+  before it exits (60 s by default), and an open tab's `/ws` handler only
+  returns when its socket closes — so a SIGTERM with a tab open used to take
+  ~45 s. `on_shutdown` closes every hub socket (1001 Going Away; the tab
+  reconnects with backoff to the next start) and `shutdown_timeout` is 3 s:
+  jobs run as tasks, not inside requests, so nothing needs the long grace.
 - Server binds 127.0.0.1 only; non-GET requests and the websocket require a
   localhost `Host`/`Origin` (CSRF guard for a localhost tool).
 - A trivial agent turn costs ~$0.27 of subscription quota (the claude_code
