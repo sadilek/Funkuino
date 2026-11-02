@@ -33,8 +33,12 @@
  * @typedef {{ path: string|null, mp3: boolean, hint: string|null }} ToolState
  * @typedef {{ units?: Unit[], syncManifest?: SyncManifest, device?: Device|null, jobs?: Jobs,
  *   agent?: AgentState, rfid?: { listening: boolean }, player?: Player|null,
- *   tools?: { ffmpeg?: ToolState }, prefs?: { librarySort?: "date"|"alpha" },
+ *   tools?: { ffmpeg?: ToolState }, prefs?: { librarySort?: "date"|"alpha", printType?: string },
+ *   cards?: { printTypes?: PrintType[] },
  *   cardsBacklog?: { newCovers?: number, perPage?: number } }} StatePayload
+ * @typedef {{ title: string, text: string[], url: string, linkText?: string }} PrintNotice
+ * @typedef {{ id: string, label: string, page?: boolean, notice?: PrintNotice|null,
+ *   consented?: boolean }} PrintType
  * @typedef {{ phase: "probe"|"download"|"merge"|"done", item?: number, total?: number,
  *   title?: string, bytes?: number, bytesTotal?: number|null, ts?: number }} IntakeProgress
  * @typedef {{ id: string, fileOrUrl: string, playMode: number, unitId: string|null }} Assignment
@@ -187,6 +191,9 @@ const State = {
   /** @type {Set<string>|null} */ knownUnitIds: null,    // prev fetch's ids; new ones flash
   /** @type {Player|null} */ player: null,               // now-playing on the device
   /** @type {"date"|"alpha"} */ sortMode: "date",        // library sort, persisted in config.json
+  /** @type {string} */ printType: "",                   // print medium, persisted in config.json
+  /** @type {PrintType[]} */ printTypes: [],             // what the server offers
+  printPage: true,                  // does the chosen medium print pages (paper) or cards
   /** @type {{cards?: boolean, agent?: boolean}} */ features: {},  // server-side feature flags
   _reconnecting: false,
 };
@@ -281,7 +288,12 @@ async function refreshState(refresh) {
     State.player = s.player || null;
     State.features = s.features || {};
     State.sortMode = (s.prefs && s.prefs.librarySort) === "alpha" ? "alpha" : "date";
+    State.printTypes = (s.cards && s.cards.printTypes) || [];
+    State.printType = (s.prefs && s.prefs.printType)
+      || (State.printTypes[0] && State.printTypes[0].id) || "pdf";
+    State.printPage = printTypeInfo(State.printType).page;
     updateSortToggleLabel();
+    renderPrintType();
     applyFeatureVisibility();
     renderDeviceChip(s.device);
     renderToolBanner(s.tools);
@@ -815,16 +827,18 @@ async function printSelected() {
     .filter(u => PrintSel.has(u.id) && u.cover && u.cover.status === "present")
     .map(u => /** @type {string} */ (u.cover && u.cover.rel));
   if (!rels.length) return;
+  // The render request returns only once the job is done, and its log streams
+  // in meanwhile: clear the pane before, never after (that wiped an order's
+  // page and its failed cards the moment they had arrived).
+  startCardsLog(rels.length + " Karten werden gedruckt…");
+  const picked = new Set(PrintSel);
+  PrintSel.clear();
+  renderLibrary(); renderPrintBar();
   try {
-    await api("/api/cards/render", "POST", { rels });
-    $("#cards-log").replaceChildren();
-    setCardsRunning(true);
-    PrintSel.clear();
-    renderLibrary(); renderPrintBar();
-    toast("Druck gestartet", "ok");
+    await api("/api/cards/render", "POST", { rels, printType: State.printType });
   } catch (/** @type {any} */ e) {
-    if (e.status === 409) toast("Es läuft bereits ein Karten-Vorgang.");
-    else toast("Drucken fehlgeschlagen: " + e.message);
+    cardsRequestFailed(e, "Drucken");
+    if (e.status !== 409) { picked.forEach(id => PrintSel.add(id)); renderLibrary(); renderPrintBar(); }
   }
 }
 
@@ -1123,6 +1137,14 @@ function renderBacklog(n, per) {
     $("#backlog-cap").textContent = "Keine neuen Cover.";
     return;
   }
+  // A full page is a paper idea: a medium that prints one card at a time has no
+  // pages to fill, so neither the counter nor its caption may talk about them.
+  if (!State.printPage) {
+    $("#backlog-word").textContent = "noch nicht gedruckte Cover";
+    $("#backlog-fill").style.width = "0%";
+    $("#backlog-cap").textContent = "Einzeln drucken — keine volle Seite nötig.";
+    return;
+  }
   const fullPages = Math.floor(n / per);
   const rest = n % per;
   $("#backlog-word").textContent = "noch nicht gedruckte Cover";
@@ -1216,15 +1238,27 @@ function toggleCover(rel) {
   if (i >= 0) Cards.selection.splice(i, 1);
   else Cards.selection.push(rel);
   renderCoversGrid();
-  if (Cards.selection.length >= Cards.perPage) renderCardsPage();   // auto-render a full page
+  // A full page is what a paper sheet needs; ordering cards the moment the 12th
+  // tile is clicked is not something to do behind the user's back, so a
+  // non-page medium submits only when the button is pressed.
+  if (State.printPage && Cards.selection.length >= Cards.perPage) renderCardsPage();
 }
 
 function renderPickerBar() {
   const n = Cards.selection.length;
   const cnt = $("#pick-count"); if (cnt) cnt.textContent = String(n);
   const per = $("#pick-per"); if (per) per.textContent = String(Cards.perPage);
+  // Same reason as the backlog: a medium without pages must not offer "the next
+  // page" — the counter drops it and the button orders instead of rendering.
+  const page = State.printPage;
+  const pageEl = $("#pick-page"); if (pageEl) pageEl.hidden = !page;
+  const noPage = $("#pick-nopage"); if (noPage) noPage.hidden = page;
+  const render = $("#pick-render");
+  if (render) {
+    render.textContent = page ? "Seite erzeugen" : "Bestellen";
+    render.disabled = n === 0 || State.cardsRunning;
+  }
   const clear = $("#pick-clear"); if (clear) clear.disabled = n === 0 || State.cardsRunning;
-  const render = $("#pick-render"); if (render) render.disabled = n === 0 || State.cardsRunning;
 }
 
 function clearSelection() {
@@ -1235,17 +1269,35 @@ function clearSelection() {
 async function renderCardsPage() {
   if (State.cardsRunning || !Cards.selection.length) return;
   const rels = Cards.selection.slice();
+  startCardsLog(rels.length + " Karten werden gedruckt…");   // before: see printSelected
+  Cards.selection = [];          // consumed; printed state arrives via reload
+  renderCoversGrid();
   try {
-    await api("/api/cards/render", "POST", { rels });
-    $("#cards-log").replaceChildren();
-    setCardsRunning(true);
-    appendLog("cards-log", "Seite mit " + rels.length + " Karten wird erzeugt…");
-    Cards.selection = [];          // consumed; printed state arrives via reload
-    renderCoversGrid();
+    await api("/api/cards/render", "POST", { rels, printType: State.printType });
   } catch (/** @type {any} */ e) {
-    if (e.status === 409) toast("Es läuft bereits ein Karten-Vorgang.");
-    else toast("Seite erzeugen fehlgeschlagen: " + e.message);
+    cardsRequestFailed(e, State.printPage ? "Seite erzeugen" : "Bestellen");
+    if (e.status !== 409) { Cards.selection = rels; renderCoversGrid(); }
   }
+}
+
+/** A picker job starts: fresh log, buttons locked until cards.done.
+ *  @param {string} line */
+function startCardsLog(line) {
+  $("#cards-log").replaceChildren();
+  appendLog("cards-log", line);
+  const out = /** @type {HTMLDetailsElement|null} */ (document.querySelector("details.cards-output"));
+  if (out) out.open = true;
+  setCardsRunning(true);
+}
+
+/** A picker request the server refused (a running job ends with cards.done
+ *  instead, which also unlocks the buttons).
+ *  @param {any} e @param {string} label */
+function cardsRequestFailed(e, label) {
+  if (e.status === 409) { toast("Es läuft bereits ein Karten-Vorgang."); return; }
+  if (State.cardsRunning) setCardsRunning(false);
+  appendLog("cards-log", label + " fehlgeschlagen: " + e.message);
+  toast(label + " fehlgeschlagen: " + e.message);
 }
 
 /* =============================== 8. Agent =============================== */
@@ -2076,11 +2128,110 @@ function initSyncCards() {
   $("#device-ping").addEventListener("click", pingDevice);
   $("#device-chip").addEventListener("click", pingDevice);
 
-  $("#cards-print").addEventListener("click", () => cardsAction("/api/cards/print", { dryRun: false }, "Drucken"));
-  $("#cards-dry").addEventListener("click", () => cardsAction("/api/cards/print", { dryRun: true }, "Dry-Run"));
+  $("#cards-print").addEventListener("click", () => cardsAction("/api/cards/print", { dryRun: false, printType: State.printType }, "Drucken"));
+  $("#cards-dry").addEventListener("click", () => cardsAction("/api/cards/print", { dryRun: true, printType: State.printType }, "Dry-Run"));
+  // Rückgängig is medium-agnostic: it reverts the newest run in the manifest,
+  // whoever wrote it, so it sends no print type.
   $("#cards-undo").addEventListener("click", () => cardsAction("/api/cards/undo", {}, "Rückgängig"));
   $("#pick-clear").addEventListener("click", clearSelection);
   $("#pick-render").addEventListener("click", renderCardsPage);
+  $("#print-type").addEventListener("change", (/** @type {any} */ e) => choosePrintType(e.target.value));
+  $("#consent-accept").addEventListener("click", () => closeConsent(true));
+  $("#consent-decline").addEventListener("click", () => closeConsent(false));
+  $("#consent-dialog").addEventListener("cancel", (/** @type {Event} */ e) => { e.preventDefault(); closeConsent(false); });
+}
+
+/** Switch the print medium. One that sends the covers to somebody else's
+ *  server asks first, once: declined, the select goes back to what it was.
+ *  The server stores the choice and the consent together (and refuses the
+ *  medium without it), so the consent is not a browser-local flag.
+ *  @param {string} id */
+async function choosePrintType(id) {
+  const info = printTypeInfo(id);
+  let consent = false;
+  if (info.notice && !info.consented) {
+    consent = await askPrintConsent(info);
+    if (!consent) { renderPrintType(); return; }
+  }
+  try {
+    await api("/api/prefs", "POST", consent ? { printType: id, consent: true } : { printType: id });
+  } catch (/** @type {any} */ err) {
+    toast("Drucker nicht gespeichert: " + err.message);
+    renderPrintType();
+    return;
+  }
+  if (consent) info.consented = true;
+  State.printType = id;
+  State.printPage = info.page !== false;
+  renderPrintType();
+  renderPickerBar();                     // counter and button follow the medium
+  if (isTabActive("karten")) loadCovers();
+}
+
+/** @type {((ok: boolean) => void)|null} */
+let consentResolve = null;
+
+/** Show a medium's third-party notice; resolves true for "Okay, Dienst nutzen".
+ *  @param {PrintType} info @returns {Promise<boolean>} */
+function askPrintConsent(info) {
+  const notice = /** @type {PrintNotice} */ (info.notice);
+  $("#consent-title").textContent = notice.title;
+  const link = el("a", {
+    class: "consent-link", href: notice.url, target: "_blank", rel: "noopener",
+    text: "Zum Dienst: " + (notice.linkText || notice.url),
+    // Opened by Studio itself: the macOS app's web view opens no new windows.
+    onclick: (/** @type {MouseEvent} */ e) => {
+      e.preventDefault();
+      api("/api/cards/notice-open", "POST", { printType: info.id })
+        .catch((/** @type {any} */ err) => toast("Konnte die Seite nicht öffnen: " + err.message));
+    },
+  });
+  $("#consent-body").replaceChildren(...notice.text.map(t => el("p", { text: t })), link);
+  const dlg = /** @type {HTMLDialogElement} */ ($("#consent-dialog"));
+  if (!dlg.open) dlg.showModal();
+  return new Promise(resolve => { consentResolve = resolve; });
+}
+
+/** @param {boolean} ok */
+function closeConsent(ok) {
+  const dlg = /** @type {HTMLDialogElement} */ ($("#consent-dialog"));
+  if (dlg.open) dlg.close();
+  const resolve = consentResolve;
+  consentResolve = null;
+  if (resolve) resolve(ok);
+}
+
+/** The chosen medium's entry, with a paper-shaped fallback while state loads.
+ *  @param {string} id */
+function printTypeInfo(id) {
+  return State.printTypes.find(t => t.id === id) || { id: id, label: id, page: true };
+}
+
+/** Fill the print-medium select in the Kartendruck toolbar from the server's
+ *  list and show what is in force. The option labels are the backend's own
+ *  (they are user-facing copy); Studio only knows the ids. The buttons that act
+ *  on the whole backlog follow the medium too: a sheet is printed, a card order
+ *  is placed, and neither word is right for the other. */
+function renderPrintType() {
+  const sel = /** @type {HTMLSelectElement|null} */ (document.getElementById("print-type"));
+  if (!sel) return;
+  const wanted = State.printTypes.map(t => t.id).join("|");
+  if (sel.dataset.ids !== wanted) {
+    sel.dataset.ids = wanted;
+    sel.replaceChildren(...State.printTypes.map(t => el("option", { value: t.id, text: t.label })));
+  }
+  if (State.printType) sel.value = State.printType;
+  const info = printTypeInfo(State.printType);
+  sel.title = "Worauf gedruckt wird: " + info.label
+    + " — gilt für Kartendruck und Bibliothek.";
+  const print = $("#cards-print");
+  if (print) {
+    print.textContent = State.printPage ? "Drucken (neue)" : "Bestellen (neue)";
+    print.title = State.printPage
+      ? "" : "Die noch nicht gedruckten Cover als Karten bestellen";
+  }
+  const bar = $("#print-bar-go");
+  if (bar) bar.textContent = State.printPage ? "Drucken" : "Bestellen";
 }
 
 function updateSortToggleLabel() {

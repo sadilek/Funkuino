@@ -164,6 +164,13 @@
         <div class="backlog-cap" id="backlog-cap"></div>
       </div>
       <div class="btn-row cards-head-actions">
+        <!-- Worauf gedruckt wird: die Liste kommt vom Server (cards.printTypes), also
+             aus der Registry der Druck-Backends. Der Regler steht hier, wo gedruckt
+             wird, gilt aber auch für die Druckleiste in der Bibliothek. -->
+        <label class="print-type" title="Worauf die Karten gedruckt werden — gilt auch für die Druckleiste in der Bibliothek.">
+          <span class="pt-label">Drucker</span>
+          <select id="print-type" class="input pt-select" aria-label="Drucker"></select>
+        </label>
         <button id="cards-print" class="btn primary">Drucken (neue)</button>
         <button id="cards-dry" class="btn">Dry-Run</button>
         <button id="cards-undo" class="btn">Rückgängig</button>
@@ -171,7 +178,7 @@
     </div>
 
     <div class="picker-bar">
-      <div class="picker-count"><b id="pick-count">0</b> / <span id="pick-per">12</span> für die nächste Seite</div>
+      <div class="picker-count"><b id="pick-count">0</b><span id="pick-page"> / <span id="pick-per">12</span> für die nächste Seite</span><span id="pick-nopage" hidden> ausgewählt</span></div>
       <span class="spacer"></span>
       <button id="pick-clear" class="btn" disabled>Auswahl leeren</button>
       <button id="pick-render" class="btn primary" disabled>Seite erzeugen</button>
@@ -192,6 +199,20 @@
   <button id="print-bar-go" class="btn primary">Drucken</button>
   <button id="print-bar-clear" class="in-dismiss" title="Auswahl leeren">×</button>
 </div>
+
+<!-- Vor der ersten Nutzung eines Druckdiensts, der die Cover an einen fremden
+     Server schickt: Text, Titel und Link liefert das Backend (notice()). -->
+<dialog id="consent-dialog" class="mini-dialog consent-dialog" aria-labelledby="consent-title">
+  <div class="md-head">
+    <div class="md-title" id="consent-title"></div>
+  </div>
+  <div id="consent-body" class="md-body"></div>
+  <div class="md-foot">
+    <span class="spacer"></span>
+    <button type="button" id="consent-decline" class="btn">Ablehnen</button>
+    <button type="button" id="consent-accept" class="btn primary">Okay, Dienst nutzen</button>
+  </div>
+</dialog>
 
 <dialog id="unassign-dialog" class="mini-dialog">
   <div class="md-head">

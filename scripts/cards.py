@@ -25,6 +25,13 @@ Like ./sync, this keeps a manifest so you don't have to say *what* to print:
 By default a real run marks the covers it laid out as printed, so the next
 plain ./cards only picks up newly-added covers. Use --no-mark to generate a
 sheet without touching the manifest, or --dry-run to preview.
+
+**Other media.** What a card *is* and where it goes is a backend's business
+(card_backends): this command selects the covers, hands them over and marks
+them — nothing here knows about paper. So a print service can add itself as
+`--backend <name>` without this file growing a branch for it:
+
+    ./cards --backend kartenschmiede    # a card service, not a sheet
 """
 
 from __future__ import annotations
@@ -37,6 +44,7 @@ from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw
 
+import card_backends
 import espuino
 from print_state import PrintState
 
@@ -179,9 +187,49 @@ def collect_covers(root: Path) -> list[Path]:
     return sorted(found)
 
 
+def record_run(state: PrintState, covers: list[Path], artifact: card_backends.Artifact,
+               when: str) -> int:
+    """Write a backend's run into the print manifest; returns how many covers
+    it marked printed.
+
+    The ONE place a print is recorded, whoever asked for it and on whatever
+    medium: ``cards`` calls it, and so does Studio's cover picker — which is
+    what keeps the paper sheet, the card order and the UI's "printed" state
+    from drifting apart. Only the covers the medium reports as placed are
+    marked: a card the service refused must stay "new", or it is never
+    ordered again.
+    """
+    if artifact.placed is not None:
+        covers = list(artifact.placed)
+    covers_dir = espuino.DEFAULT_COVERS_DIR
+    items = [(str(p.resolve().relative_to(covers_dir.resolve())),
+              p.stat().st_size, p.stat().st_mtime) for p in covers]
+    state.mark_run(items, artifact.run_out, when)
+    # A medium without a file of its own can say what it is instead — a card
+    # service records its order page in `url`, next to the covers it placed.
+    run = state.runs[-1]
+    if artifact.run_out is None:
+        run.pop("out", None)          # one spelling per fact: no `out: null`
+    run.update(artifact.run_fields or {})
+    state.save()
+    return len(covers)
+
+
+def _report(exc: card_backends.BackendError) -> int:
+    """A medium's failure as one line on stderr, flushing stdout first so piped
+    output stays in the order it was produced in."""
+    sys.stdout.flush()
+    print(f"ERROR: {exc}", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
+    # The backend is loaded first: which flags are legal is its business, so it
+    # declares its own into the parser below (`cards --backend X --its-flag …`).
+    backend = card_backends.load(card_backends.peek_backend(argv))
+
     parser = argparse.ArgumentParser(
-        description="Lay out card covers into printable A4 PDF sheets.",
+        description=f"Lay card covers out for printing ({backend.LABEL}).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("path", nargs="?",
@@ -191,23 +239,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true",
                         help="List what would be printed; write and mark nothing")
     parser.add_argument("--no-mark", action="store_true",
-                        help="Generate the PDF but do not mark covers as printed")
+                        help="Produce the output but do not mark covers as printed")
     parser.add_argument("--reset", action="store_true",
                         help="Forget print history (optionally limited to PATH) and exit")
     parser.add_argument("--undo", action="store_true",
                         help="Revert the most recent run: its covers count as new "
                              "again and its auto-generated sheet is removed. Repeat "
                              "to step further back. Then exit.")
-    parser.add_argument("--cols", type=int, default=DEFAULT_COLS,
-                        help="Cards per row")
-    parser.add_argument("--card-cm", type=float, default=DEFAULT_CARD_CM,
-                        help="Card edge length in centimetres")
-    parser.add_argument("--no-marks", action="store_true",
-                        help="Do not draw cut-guide tick marks")
-    parser.add_argument("--no-trim", action="store_true",
-                        help="Do not trim solid side bars before squaring")
-    parser.add_argument("--out", help="Output PDF path (default: print-sheets/cards-<timestamp>.pdf)")
+    parser.add_argument("--backend", default=backend.NAME,
+                        help="Which medium to print on ("
+                             + ", ".join(e["id"] for e in card_backends.registry()) + ")")
+    parser.add_argument("--open", action=argparse.BooleanOptionalAction, default=True,
+                        help="Open the result when done (default); --no-open to stay "
+                             "put, e.g. on a machine without a browser")
+    backend.add_arguments(parser)
     args = parser.parse_args(argv)
+
+    # A flag that is about the medium's own bookkeeping rather than about the
+    # covers (list/forget an order) never reaches the selection below.
+    preflight = getattr(backend, "preflight", None)
+    if preflight is not None:
+        try:
+            if (code := preflight(args)) is not None:
+                return code
+        except card_backends.BackendError as exc:
+            return _report(exc)
 
     covers_dir = espuino.DEFAULT_COVERS_DIR
     root = covers_dir
@@ -244,6 +300,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Removed the superseded sheet {pdf.name}.")
             else:
                 print(f"(Left {pdf} in place — delete it yourself if not needed.)")
+        if url := run.get("url"):
+            # Undo is the print history's; an order lives at the service and
+            # cannot be taken back from here.
+            print(f"NOTE: the order at {url} is not cancelled — it stays there as a "
+                  f"draft with its cards. Ordering these covers again starts a "
+                  f"second order; delete the cards on that page first (on the command "
+                  f"line, --uuid {url.rstrip('/').rsplit('/', 1)[-1]} adds to this "
+                  f"order instead and skips the cards already in it).")
         return 0
 
     if not root.exists():
@@ -269,44 +333,38 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     kind = "cover(s)" if args.all else "new cover(s)"
-    print(f"{len(covers)} {kind} to lay out "
-          f"({args.cols} per row, {args.card_cm:g}x{args.card_cm:g} cm):")
+    print(f"{len(covers)} {kind} for {backend.LABEL}:")
     for p in covers:
         print(f"  {rel_of(p)}")
 
     if args.dry_run:
-        _, per_page = page_grid(args.card_cm, args.cols)
-        short = (-len(covers)) % per_page
-        if short:
-            print(f"\nNOTE: the last page would have {per_page - short}/{per_page} "
-                  f"cards. Add {short} more cover(s) for a full page.")
+        try:
+            extra = backend.describe(covers, args)
+        except card_backends.BackendError as exc:
+            return _report(exc)
+        if extra:
+            print(f"\n{extra}")
         print("\n(dry run — nothing written)")
         return 0
 
-    pages = render_pages(covers, args.card_cm, args.cols,
-                         marks=not args.no_marks, trim=not args.no_trim)
-    out = Path(args.out) if args.out else (
-        espuino.PRINT_SHEETS_DIR / f"cards-{time.strftime('%Y%m%d-%H%M%S')}.pdf")
-    save_pdf(pages, out)
-    print(f"\nWrote {out}  ({len(pages)} page(s), {len(covers)} card(s)).")
+    try:
+        artifact = backend.emit(covers, args, log=print)
+    except card_backends.BackendError as exc:
+        return _report(exc)
 
-    # Full pages only laminate well, so flag a partial last page: say how many
-    # more covers would fill it (download that many more, then re-run ./cards).
-    _, per_page = page_grid(args.card_cm, args.cols)
-    short = (-len(covers)) % per_page
-    if short:
-        print(f"NOTE: the last page has {per_page - short}/{per_page} cards. "
-              f"Add {short} more cover(s) for a full page — or './cards --undo' "
-              f"to drop this run, download more, and reprint a full sheet.")
-
-    if not args.no_mark:
-        items = [(rel_of(p), p.stat().st_size, p.stat().st_mtime) for p in covers]
-        state.mark_run(items, str(out), time.strftime("%Y-%m-%d %H:%M:%S"))
-        state.save()
-        print(f"Marked {len(covers)} cover(s) as printed "
-              f"(undo with ./cards --undo, or ./cards --reset to redo all).")
-    else:
+    if args.no_mark:
         print("(--no-mark: manifest unchanged; these covers still count as new.)")
+    else:
+        marked = record_run(state, covers, artifact, time.strftime("%Y-%m-%d %H:%M:%S"))
+        print(f"Marked {marked} cover(s) as printed "
+              f"(undo with ./cards --undo, or ./cards --reset to redo all).")
+        if marked < len(covers):
+            print(f"NOTE: {len(covers) - marked} cover(s) were not placed and still "
+                  f"count as new.")
+
+    if args.open:
+        if problem := card_backends.reveal(artifact.open_target):
+            print(f"(could not open it: {problem})", file=sys.stderr)
     return 0
 
 

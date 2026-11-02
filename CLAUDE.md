@@ -50,7 +50,8 @@ Funkuino/
     download.py         # yt-dlp download in the ESPuino naming conventions
     prepare.py          # concat + spoken intro (Hörspiel merge)
     covers.py           # extract embedded covers -> card-covers/
-    cards.py            # compose printable A4 card sheets from card-covers/
+    cards.py            # select due covers, hand them to a print backend, mark them
+    card_backends/      # print media: pdf.py (A4 sheets), kartenschmiede.py (card service)
     print_state.py      # manifest of already-printed covers
     studio.py           # Studio: aiohttp server, WS hub, sync/cards jobs
     studio_state.py     # Studio: library scan -> per-card pipeline status
@@ -212,6 +213,11 @@ Why not `scripts/`: that is the code root, read-only in a packaged app. The
 private overlay's `install` therefore links into `extensions/` and cleans up its
 older `scripts/topic.py` / `.agent-allow.json` links (which still work in a
 checkout — `.agent-allow.json` is still read — but have no place in an app).
+
+Print media follow the same idea: `<data folder>/extensions/card_backends/<name>.py`
+adds a `cards --backend <name>` (see *Print backends*). A shipped backend of the
+same name wins, and a plugin is loaded by file path, so it cannot shadow a
+shipped module.
 
 ## Quickstart
 
@@ -457,6 +463,48 @@ reverted exactly, and `--reset` prunes that history too.
 
 Other flags: `--cols N`, `--card-cm F`, `--no-marks` (no cut ticks), `--no-trim`
 (skip bar trimming), `--out FILE`. Uses **Pillow**; pages render at 300 DPI.
+`--open` (default) hands the result over (`card_backends.reveal`: `open` on
+macOS, `os.startfile` on Windows, `xdg-open` for a file elsewhere).
+
+### Print backends (`--backend`)
+
+`cards` owns *which* covers are due and the marking; the medium is a backend in
+`scripts/card_backends/` (contract in its `__init__.py`): `NAME`, `LABEL`,
+`PAGE`, `add_arguments`, `describe` (dry run), `emit` → `Artifact`, optionally
+`preflight` and `notice`. `cards.record_run()` is the **one** place a run is
+written into `status/print-history.json`, for the CLI and Studio alike, so
+`--undo`/`--reset` mean the same for every medium. It marks only the covers the
+artifact lists as `placed` (all when None): a card the service refused stays
+new, or it would never be ordered again. `pdf` is the default and the A4 path
+above, unchanged.
+
+**`kartenschmiede`** turns the due covers into a *draft* order at a card
+service (a small shop with a card printer; the customer reviews and pays on the
+order page, which `--open` opens). It uses only the credential-free customer
+API — the order uuid is the credential — and records the order page as `url`
+(plus `type: "pvc"`) on the run, so the print history is the only order record:
+`--list` reads them back, `--forget UUID` strips the page from it. `--uuid U`
+adds to an existing order and skips cards already in it. The cover goes up
+exactly as it is on disk; the service fits it. The server defaults to the
+reference deployment (`DEFAULT_SERVER`, run by the contributor of the backend —
+accepted on purpose); `--server`, `KARTENSCHMIEDE_SERVER` or
+`kartenschmiede_server` in `config.json` point it elsewhere. Not in
+`credentials.env`: the address is no secret.
+
+- **Third party, asked first.** A backend whose covers leave the machine
+  provides `notice()` (title, text, link, in German like `LABEL`). Studio shows
+  it as a dialog the first time the medium is chosen ("Okay, Dienst nutzen" /
+  "Ablehnen"); only accepting stores the choice, together with the id in
+  `print_consent` in `config.json`. The server refuses the medium in prefs,
+  print and render requests until then (403 `needsConsent`), and a stored
+  `print_type` without consent falls back to `pdf`. The CLI does not ask: typing
+  `--backend kartenschmiede` is the choice. The dialog's link is opened by
+  Studio (`/api/cards/notice-open`, only the backend's own address), because
+  the macOS app's web view opens no new windows.
+- **Undo cannot cancel an order.** `--undo` makes the covers new again and says
+  that the draft stays at the service (re-ordering starts a second order).
+  `--reset` keeps a run that carries an order page, with its covers pruned, so
+  `--list` still knows the order; `undo_last` skips such runs.
 
 ## Funkuino Studio (`./studio`)
 
@@ -499,6 +547,16 @@ cards), **Agent**, **Sync** (mirror with live log; Dry-Run always previews
   Pipeline status comes from the existing manifests only — sync from the newest
   `status/sync-*.json`, print from `status/print-history.json`, covers from
   `card-covers/` — Studio adds no state files of its own.
+- **Print medium**: a "Drucker" select in the Kartendruck toolbar lists the
+  backend registry (`/api/state` → `cards.printTypes`); the choice is
+  `print_type` in `config.json` and applies to the toolbar buttons, the picker
+  and the Bibliothek's print bar alike. A medium without pages (`page: false`)
+  drops the "N / 12 für die nächste Seite" counter and the auto-submit on the
+  twelfth tile, and its buttons say "Bestellen". A Studio job only opens what
+  it added to the print history: "nothing new" and Rückgängig add no run, so
+  nothing pops up. The picker clears the log *before* its render request (the
+  request returns only when the job is done), so an order's page and its
+  failed cards stay readable.
 - **Library sort**: a toolbar button switches between date (groups and rows
   newest-first, the default) and A–Z: series in German phone book order
   (`de-u-co-phonebk`, ä = ae), numbers natural (Folge 2 before Folge 10),
