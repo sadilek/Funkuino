@@ -897,7 +897,15 @@ Two artifacts, one version: `pyproject.toml` owns it and `mac/Makefile` derives
    run it before uploading.
 5. The app: `make release` in `mac/` (needs `DEV_ID` and `NOTARY_PROFILE`) —
    signs, notarises, staples, and produces the signed DMG. One architecture per
-   build, so an Intel DMG means the same target on an Intel Mac.
+   build, so an Intel DMG means the same target on an Intel Mac. On the
+   maintainer's Mac: `DEV_ID="Developer ID Application: DANIEL ALEXANDER DR.
+   SADILEK (X222MTUFTP)" NOTARY_PROFILE=funkuino`. The profile lives in the
+   data-protection keychain, so `security find-generic-password` does not see
+   it; `xcrun notarytool history --keychain-profile funkuino` proves it works.
+   `runtime.py` and `ffmpeg.py` run under the `python3` on PATH and need
+   `tarfile`'s `filter=` (3.12+, or a late patch release of older ones), which
+   macOS's own 3.9.6 lacks: with it first on PATH, prefix
+   the call with `PATH=/opt/homebrew/bin:$PATH`.
 6. Attach the DMG(s) to the GitHub release. Then install the *published* wheel
    somewhere clean (`pipx install funkuino` in a container) before announcing
    it — the artifact on PyPI is what users get, not the one in `dist/`.
