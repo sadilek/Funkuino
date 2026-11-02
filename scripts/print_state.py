@@ -72,10 +72,16 @@ class PrintState:
     def undo_last(self) -> dict | None:
         """Revert the most recent run: restore each key to its pre-run value
         (delete if it was newly added). Returns the popped run dict, or None if
-        there is no run to undo."""
-        if not self.runs:
+        there is no run to undo.
+
+        A run that marks nothing any more is skipped: ``forget_under`` keeps a
+        card order's run for its page after pruning its covers (see there), and
+        undoing that would revert nothing."""
+        index = next((i for i in range(len(self.runs) - 1, -1, -1)
+                      if self.runs[i].get("changes")), None)
+        if index is None:
             return None
-        run = self.runs.pop()
+        run = self.runs.pop(index)
         for k, prev in run.get("changes", {}).items():
             if prev is None:
                 self.printed.pop(k, None)
@@ -114,9 +120,11 @@ class PrintState:
         for k in victims:
             del self.printed[k]
         # Prune undo history: drop forgotten keys from each run, then any run
-        # that no longer records anything.
+        # that no longer records anything. A run with an order page (``url``,
+        # a card service's) stays: the order exists at the service whatever the
+        # history says, and its page is the only place it is written down.
         for run in self.runs:
             for k in [k for k in run.get("changes", {}) if under(k)]:
                 del run["changes"][k]
-        self.runs = [r for r in self.runs if r.get("changes")]
+        self.runs = [r for r in self.runs if r.get("changes") or r.get("url")]
         return len(victims)

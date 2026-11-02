@@ -188,14 +188,19 @@ def collect_covers(root: Path) -> list[Path]:
 
 
 def record_run(state: PrintState, covers: list[Path], artifact: card_backends.Artifact,
-               when: str) -> None:
-    """Write a backend's run into the print manifest.
+               when: str) -> int:
+    """Write a backend's run into the print manifest; returns how many covers
+    it marked printed.
 
     The ONE place a print is recorded, whoever asked for it and on whatever
     medium: ``cards`` calls it, and so does Studio's cover picker — which is
     what keeps the paper sheet, the card order and the UI's "printed" state
-    from drifting apart.
+    from drifting apart. Only the covers the medium reports as placed are
+    marked: a card the service refused must stay "new", or it is never
+    ordered again.
     """
+    if artifact.placed is not None:
+        covers = list(artifact.placed)
     covers_dir = espuino.DEFAULT_COVERS_DIR
     items = [(str(p.resolve().relative_to(covers_dir.resolve())),
               p.stat().st_size, p.stat().st_mtime) for p in covers]
@@ -207,6 +212,7 @@ def record_run(state: PrintState, covers: list[Path], artifact: card_backends.Ar
         run.pop("out", None)          # one spelling per fact: no `out: null`
     run.update(artifact.run_fields or {})
     state.save()
+    return len(covers)
 
 
 def _report(exc: card_backends.BackendError) -> int:
@@ -294,6 +300,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Removed the superseded sheet {pdf.name}.")
             else:
                 print(f"(Left {pdf} in place — delete it yourself if not needed.)")
+        if url := run.get("url"):
+            # Undo is the print history's; an order lives at the service and
+            # cannot be taken back from here.
+            print(f"NOTE: the order at {url} is not cancelled — it stays there as a "
+                  f"draft with its cards. Ordering these covers again starts a "
+                  f"second order; delete the cards on that page first (on the command "
+                  f"line, --uuid {url.rstrip('/').rsplit('/', 1)[-1]} adds to this "
+                  f"order instead and skips the cards already in it).")
         return 0
 
     if not root.exists():
@@ -341,9 +355,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_mark:
         print("(--no-mark: manifest unchanged; these covers still count as new.)")
     else:
-        record_run(state, covers, artifact, time.strftime("%Y-%m-%d %H:%M:%S"))
-        print(f"Marked {len(covers)} cover(s) as printed "
+        marked = record_run(state, covers, artifact, time.strftime("%Y-%m-%d %H:%M:%S"))
+        print(f"Marked {marked} cover(s) as printed "
               f"(undo with ./cards --undo, or ./cards --reset to redo all).")
+        if marked < len(covers):
+            print(f"NOTE: {len(covers) - marked} cover(s) were not placed and still "
+                  f"count as new.")
 
     if args.open:
         if problem := card_backends.reveal(artifact.open_target):

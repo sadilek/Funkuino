@@ -22,6 +22,10 @@ A backend module provides, at module level:
                                              # and return an exit code
     def describe(covers, args) -> str | None  # extra lines for --dry-run
     def emit(covers, args, log=print) -> Artifact
+    def notice() -> dict                     # optional: the medium sends the
+                                             # covers to a third party; Studio
+                                             # shows {title, text, url, linkText}
+                                             # before it is first used
 
 ``emit`` does the work and returns the run's record; the marking, the counting
 and the "nothing new" logic stay in ``cards`` so every medium feeds the one
@@ -68,12 +72,16 @@ class Artifact(NamedTuple):
     to, or None for a medium that has no file); ``run_fields`` are extra keys
     merged into the same run — a card service records ``{"type": ..., "url":
     ...}``, which is also its order record. ``open_target`` is a file path or a
-    URL to hand to the user, and is what ``--open`` acts on.
+    URL to hand to the user, and is what ``--open`` acts on. ``placed`` lists
+    the covers that actually made it onto the medium when that is fewer than
+    were handed over (a card service refused one); only those are marked
+    printed. None means all of them.
     """
 
     run_out: str | None = None
     run_fields: dict | None = None
     open_target: str | None = None
+    placed: list[Path] | None = None
 
 
 def package_dir() -> Path:
@@ -151,7 +159,7 @@ def package_name() -> str:
 
 
 def registry() -> list[dict]:
-    """The backend list for the UI: ``[{id, label, page}]``.
+    """The backend list for the UI: ``[{id, label, page, notice}]``.
 
     A backend that fails to import is left out rather than breaking the list
     (the UI is not the place to report a broken plugin) — the name then simply
@@ -171,9 +179,15 @@ def registry() -> list[dict]:
                       if path.parent == package_dir() else _load_path(path, name))
         except Exception:  # noqa: BLE001 — a broken plugin must not break the list
             continue
+        notice = getattr(module, "notice", None)
+        try:
+            text = notice() if callable(notice) else None
+        except Exception:  # noqa: BLE001 — same rule as a failed import
+            continue
         entries.append({"id": getattr(module, "NAME", name),
                         "label": getattr(module, "LABEL", name),
-                        "page": bool(getattr(module, "PAGE", False))})
+                        "page": bool(getattr(module, "PAGE", False)),
+                        "notice": text})
     # The default medium comes first: it is what the UI falls back to when no
     # preference is stored, and what a person expects to see at the top of the
     # list. Alphabetical order would put an installed card service there.

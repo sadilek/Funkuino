@@ -730,7 +730,9 @@ class Studio:
             raise web.HTTPNotFound()
         body = await _json_body(request)
         try:
-            chosen = _checked_print_type(body.get("printType")) or _print_type()
+            chosen = _usable_print_type(body.get("printType"))
+        except ConsentMissing as exc:
+            return web.json_response({"error": str(exc), "needsConsent": True}, status=403)
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
         # --no-open: the job's own hand-off is _reveal_target below, so the
@@ -771,6 +773,11 @@ class Studio:
 
     async def _run_cards(self, argv: list[str]) -> None:
         try:
+            # How many runs the manifest held before: the job revealed below is
+            # only one that added a run. "Nothing new" and --undo add none, and
+            # the newest run then is an older one — an order page from last
+            # week, which must not pop up again.
+            runs_before = len(PrintState.load(cards.STATE_FILE).runs)
             proc = await asyncio.create_subprocess_exec(
                 *espuino.dispatcher_argv(), *argv,
                 cwd=str(espuino.DATA_ROOT),
@@ -783,22 +790,17 @@ class Studio:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT)
             assert proc.stdout is not None
-            sheet: Path | None = None
             async for raw in proc.stdout:
                 line = raw.decode("utf-8", errors="replace").rstrip()
-                # cards.py's own summary is the only handle on the file it wrote.
-                match = re.match(r"Wrote (.+\.pdf)\s", line)
-                if match:
-                    sheet = Path(match.group(1))
                 self.emit({"t": "cards.log", "line": line})
             code = await proc.wait()
             # Same courtesy as the picker: a finished job opens for the user —
-            # an order's page in the browser, or the sheet itself. The manifest's
-            # newest run says which of the two it was.
+            # an order's page in the browser, or the sheet itself. The run the
+            # job added says which of the two it was.
             if code == 0 and "--dry-run" not in argv:
-                state = PrintState.load(cards.STATE_FILE)
-                last = state.runs[-1] if state.runs else {}
-                self._reveal_target(last.get("url") or (str(sheet) if sheet else None))
+                runs = PrintState.load(cards.STATE_FILE).runs
+                if len(runs) > runs_before:
+                    self._reveal_target(runs[-1].get("url") or runs[-1].get("out"))
             self.emit({"t": "cards.done", "code": code})
         except Exception as exc:  # noqa: BLE001
             self.emit({"t": "cards.log", "line": f"FEHLER: {exc}"})
@@ -822,7 +824,8 @@ class Studio:
         _, per_page = cards.page_grid(cards.DEFAULT_CARD_CM, cards.DEFAULT_COLS)
         items = self._cover_items(state)
         items.sort(key=lambda d: d["birthtime"], reverse=True)
-        last = state.runs[-1] if state.runs else None
+        # A run that marks nothing is a kept order page (forget_under), not a print.
+        last = next((r for r in reversed(state.runs) if r.get("changes")), None)
         last_run = None if not last else {
             "at": last.get("at"), "out": last.get("out"),
             "count": len(last.get("changes", {}))}
@@ -857,7 +860,9 @@ class Studio:
         if not rels:
             return web.json_response({"error": "Keine Cover ausgewählt"}, status=400)
         try:
-            chosen = _checked_print_type(body.get("printType")) or _print_type()
+            chosen = _usable_print_type(body.get("printType"))
+        except ConsentMissing as exc:
+            return web.json_response({"error": str(exc), "needsConsent": True}, status=403)
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
         if self.cards_running:
@@ -902,10 +907,12 @@ class Studio:
         backend = card_backends.load(backend_name)
         artifact = backend.emit(covers, _backend_defaults(backend), log=log)
         state = PrintState.load(cards.STATE_FILE)
-        cards.record_run(state, covers, artifact,
-                         time.strftime("%Y-%m-%d %H:%M:%S"))
+        marked = cards.record_run(state, covers, artifact,
+                                  time.strftime("%Y-%m-%d %H:%M:%S"))
+        if marked < len(covers):
+            log(f"{len(covers) - marked} Cover nicht gedruckt; sie bleiben neu.")
         self._reveal_target(artifact.open_target)
-        return {"out": artifact.open_target, "cards": len(rels),
+        return {"out": artifact.open_target, "cards": marked,
                 "backend": backend_name}
 
     # -- targeted per-unit upload --
@@ -1203,6 +1210,26 @@ class Studio:
         self.emit({"t": "state.changed"})
         return web.json_response({"ok": True, "available": bool(self.token)})
 
+    async def h_cards_notice_open(self, request: web.Request) -> web.Response:
+        """Open a print medium's own page (the link in its third-party notice).
+
+        Through the server rather than a plain link: the macOS app's web view
+        opens no new windows, and Studio runs on the user's machine, where
+        ``card_backends.reveal`` hands the page to their browser. Only the
+        address the backend itself names is opened, never one from the request.
+        """
+        if not self.cards_enabled:
+            raise web.HTTPNotFound()
+        body = await _json_body(request)
+        entry = next((t for t in print_types() if t["id"] == body.get("printType")), None)
+        url = ((entry or {}).get("notice") or {}).get("url")
+        if not url:
+            return web.json_response({"error": "kein Link"}, status=404)
+        problem = await self.loop.run_in_executor(None, card_backends.reveal, url)
+        if problem:
+            return web.json_response({"error": problem}, status=500)
+        return web.json_response({"ok": True})
+
     async def h_prefs(self, request: web.Request) -> web.Response:
         """Store a UI preference (library sort, print medium) in config.json.
 
@@ -1219,9 +1246,18 @@ class Studio:
             changes["library_sort"] = mode
         if "printType" in body:
             try:
-                changes["print_type"] = _checked_print_type(body.get("printType"))
+                chosen = _checked_print_type(body.get("printType"))
             except ValueError as exc:
                 return web.json_response({"error": str(exc)}, status=400)
+            if chosen and not _consented(chosen):
+                # The dialog's "Okay, Dienst nutzen" sends consent with the
+                # choice; without it a third-party medium cannot be chosen.
+                if body.get("consent") is not True:
+                    return web.json_response(
+                        {"error": "Dieser Druckdienst muss erst bestätigt werden.",
+                         "needsConsent": True}, status=403)
+                changes["print_consent"] = sorted({*_consents(), chosen})
+            changes["print_type"] = chosen
         if not changes:
             return web.json_response({"error": "nichts zu speichern"}, status=400)
         try:
@@ -1447,6 +1483,7 @@ class Studio:
         app.router.add_post("/api/cards/undo", self.h_cards_undo)
         app.router.add_get("/api/cards/covers", self.h_cards_covers)
         app.router.add_post("/api/cards/render", self.h_cards_render)
+        app.router.add_post("/api/cards/notice-open", self.h_cards_notice_open)
         app.router.add_post("/api/units/sync", self.h_unit_sync)
         app.router.add_post("/api/units/play", self.h_unit_play)
         app.router.add_post("/api/player/stop", self.h_player_stop)
@@ -1478,7 +1515,26 @@ LIBRARY_SORTS = ("date", "alpha")
 # — so a medium is added by dropping a module there, never by editing this file,
 # and the command line sees exactly the same set (`cards --backend …`).
 def print_types() -> list[dict]:
-    return card_backends.registry()
+    """The registry, plus whether each medium may be used: one that sends the
+    covers to a third party (it has a ``notice``) only after the user accepted
+    that notice in Studio."""
+    accepted = _consents()
+    return [{**t, "consented": not t.get("notice") or t["id"] in accepted}
+            for t in card_backends.registry()]
+
+
+class ConsentMissing(ValueError):
+    """A third-party medium was asked for before its notice was accepted."""
+
+
+def _consents() -> list[str]:
+    """The media whose third-party notice was accepted (config.json)."""
+    value = espuino.read_app_config().get("print_consent")
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def _consented(name: str) -> bool:
+    return next((t["consented"] for t in print_types() if t["id"] == name), False)
 
 
 
@@ -1561,14 +1617,15 @@ def _library_sort() -> str:
 def _print_type() -> str:
     """The stored print medium, or the default one (the A4 sheet).
 
-    A stored name that is no longer offered (the plugin providing it is gone)
-    falls back rather than breaking the UI — the select then shows the fallback,
+    A stored name that is no longer offered (the plugin providing it is gone,
+    or its third-party notice was never accepted here) falls back rather than
+    breaking the UI — the select then shows the fallback,
     and the pref is left for the day the backend is back. The fallback is the
     DEFAULT backend, never "whichever comes first": alphabetically that is an
     installed card service, which would make a media order the default without
     anyone choosing it.
     """
-    types = print_types()
+    types = [t for t in print_types() if t["consented"]]
     ids = {t["id"] for t in types}
     value = espuino.read_app_config().get("print_type")
     if isinstance(value, str) and value in ids:
@@ -1590,6 +1647,16 @@ def _checked_print_type(value) -> str | None:
     if value not in {t["id"] for t in print_types()}:
         raise ValueError(f"Unbekannter Drucker: {value!r}")
     return str(value)
+
+
+def _usable_print_type(value) -> str:
+    """The medium a print request runs on: the one it names, else the stored
+    one — refused (ConsentMissing) while its third-party notice is unaccepted,
+    which the UI should have asked for before the request was ever sent."""
+    chosen = _checked_print_type(value) or _print_type()
+    if not _consented(chosen):
+        raise ConsentMissing("Dieser Druckdienst muss erst bestätigt werden.")
+    return chosen
 
 
 def _backend_defaults(backend):

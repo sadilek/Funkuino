@@ -21,8 +21,14 @@ the printing itself is the back-office's business.
 (``DEFAULT_SERVER``, publicly resolvable) — this backend talks to a card *shop*,
 and that shop is where the cards come from, so there is rarely a reason to point
 it elsewhere. Point it elsewhere anyway with, in this order: ``--server URL``,
-``ESPLP_SERVER`` (environment, then the installation's credentials file), or
-``kartenschmiede_server`` in ``config.json``. 
+``KARTENSCHMIEDE_SERVER`` in the environment, or ``kartenschmiede_server`` in
+``config.json``. The address is not a secret, so it does not go into
+``credentials.env``.
+
+**Third party.** The covers and their names leave the machine for somebody
+else's server, so ``notice()`` describes the service and Studio shows that as a
+dialog the first time the medium is chosen; the medium is usable there only
+once it was accepted (``print_consent`` in ``config.json``).
 
 The service being one operator's does not make this file operator-specific: a
 second card shop would be a second backend beside this one, which is what
@@ -60,9 +66,9 @@ DEFAULT_SERVER = "https://kartenschmiede.home.tilman.baumann.name"
 # operator nothing, and a second service belongs in a backend of its OWN,
 # `card_backends/<other>.py` beside this file, exactly like a second medium. 
 #
-# Overridable, in this order: --server, ESPLP_SERVER (environment, then the
-# installation's credentials file), `kartenschmiede_server` in config.json.
-ENV_SERVER = "ESPLP_SERVER"
+# Overridable, in this order: --server, KARTENSCHMIEDE_SERVER in the
+# environment, `kartenschmiede_server` in config.json.
+ENV_SERVER = "KARTENSCHMIEDE_SERVER"
 CONFIG_KEY = "kartenschmiede_server"
 
 # What a run in the shared print manifest says about itself. A run WITHOUT a
@@ -77,46 +83,13 @@ TIMEOUT = (5.0, 120.0)
 
 
 # --- configuration ----------------------------------------------------------
-def _env_file_values() -> dict[str, str]:
-    """``KEY=VALUE`` from the installation's credentials file, then ``<data>/.env``.
-
-    A reader of our own rather than ``espuino.parse_env``, which is newer than
-    the install this has to run on. Both files are read as UTF-8 — never the
-    locale's charset, which would mangle a URL on a non-UTF-8 system.
-    """
-    values: dict[str, str] = {}
-    candidates: list[Path] = []
-    credentials_file = getattr(espuino, "credentials_file", None)
-    if callable(credentials_file):
-        candidates.append(credentials_file())
-    candidates.append(espuino.DATA_ROOT / ".env")
-    for path in candidates:
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            values.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-    return values
-
-
-def setting(name: str) -> str | None:
-    """Environment first, then the credentials file — the order espuino.Config uses."""
-    return os.environ.get(name) or _env_file_values().get(name) or None
-
-
 def configured_server() -> str | None:
     """The address of the deployment, wherever it was configured.
 
-    ``ESPLP_SERVER`` (environment, then the credentials file) or
-    ``kartenschmiede_server`` in ``config.json``. Nothing else: this ships, so it
-    must not carry somebody's own address as a default.
+    ``KARTENSCHMIEDE_SERVER`` in the environment, or ``kartenschmiede_server``
+    in ``config.json``; None when neither is set (``DEFAULT_SERVER`` applies).
     """
-    env = setting(ENV_SERVER)
+    env = os.environ.get(ENV_SERVER)
     if env:
         return env
     try:
@@ -128,13 +101,42 @@ def configured_server() -> str | None:
 
 def _server(args) -> str:
     """The deployment this run talks to: flag, then configuration, then default."""
-    server = (getattr(args, "server", None) or configured_server()
-              or DEFAULT_SERVER or "").rstrip("/")
+    server = (getattr(args, "server", None) or server_address() or "").rstrip("/")
     if not server:
         raise card_backends.BackendError(
             "no Kartenschmiede address configured — pass --server URL, set "
             f"{ENV_SERVER}, or add \"{CONFIG_KEY}\" to {espuino.APP_CONFIG_FILE}")
     return server
+
+
+def server_address() -> str:
+    """The deployment a run without ``--server`` talks to."""
+    return (configured_server() or DEFAULT_SERVER).rstrip("/")
+
+
+def notice() -> dict:
+    """What a user is told before the first order: the covers go to a third party.
+
+    Studio shows it as a dialog the first time this medium is chosen (in the
+    UI's language, like LABEL) and keeps the medium unusable until it is
+    accepted; ``url`` is the service's own page, linked from the dialog.
+    """
+    server = server_address()
+    host = server.split("://", 1)[-1]
+    return {
+        "title": "Kartenschmiede: ein Dienst außerhalb von Funkuino",
+        "text": [
+            "Kartenschmiede ist ein kleiner Kartendruck-Dienst eines unabhängigen "
+            "Betreibers, nicht Teil von Funkuino. Er druckt eure Cover auf "
+            "Plastik-RFID-Karten und schickt sie euch zu; bestellt und bezahlt wird "
+            "auf seiner eigenen Bestellseite.",
+            f"Beim Bestellen schickt Funkuino die ausgewählten Cover-Bilder und ihre "
+            f"Namen (Ordner und Titel aus eurer Bibliothek) an den Server {host}. "
+            f"Was dort mit den Daten geschieht, bestimmt sein Betreiber.",
+        ],
+        "url": server,
+        "linkText": host,
+    }
 
 
 # --- the service ------------------------------------------------------------
@@ -330,11 +332,6 @@ def forget_bookmark(state: print_state.PrintState, order_id: str) -> int:
     return dropped
 
 
-def _now() -> str:
-    import time
-    return time.strftime("%Y-%m-%d %H:%M:%S")
-
-
 # --- helpers ----------------------------------------------------------------
 def relative(cover: Path) -> str:
     """A cover's path relative to card-covers/, as the manifest spells it."""
@@ -425,6 +422,7 @@ def emit(covers, args, log=print) -> card_backends.Artifact:
     already = {str(card.get("name")) for card in client.cards(order_id)}
 
     uploaded: list[str] = []
+    placed: list[Path] = []
     failed: list[str] = []
     for cover in covers:
         rel = relative(cover)
@@ -432,6 +430,7 @@ def emit(covers, args, log=print) -> card_backends.Artifact:
         if name in already:
             log(f"  in the order already: {rel}")
             uploaded.append(rel)
+            placed.append(cover)
             continue
         try:
             client.upload_card(order_id, name, face_bytes(cover))
@@ -441,6 +440,7 @@ def emit(covers, args, log=print) -> card_backends.Artifact:
             continue
         log(f"  card    {rel}")
         uploaded.append(rel)
+        placed.append(cover)
 
     if not uploaded:
         raise card_backends.BackendError(
@@ -452,9 +452,10 @@ def emit(covers, args, log=print) -> card_backends.Artifact:
     except (KartenschmiedeError, OSError):
         total = len(uploaded)
     log(f"\nOrder has {total} card(s).")
-    if failed:                    # cards.py leaves these unmarked and says so
-        log(f"NOTE: {len(failed)} cover(s) failed and were left unmarked: {', '.join(failed)}")
+    if failed:                    # not in `placed`, so cards.py leaves them unmarked
+        log(f"NOTE: {len(failed)} cover(s) failed; they still count as new: {', '.join(failed)}")
     log(f"\nReview and pay here: {url}")
     return card_backends.Artifact(run_out=None,
                                   run_fields={"type": RUN_TYPE, "url": url},
-                                  open_target=url)
+                                  open_target=url,
+                                  placed=placed)

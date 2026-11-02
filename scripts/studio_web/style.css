@@ -756,6 +756,9 @@ body.scrolled .picker-bar { box-shadow: 0 7px 8px -7px oklch(0.3 0.02 66 / .35);
 .mini-dialog .md-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px 10px; border-bottom: 1px solid var(--line); }
 .mini-dialog .md-title { font-family: var(--font-display); font-size: 16px; }
 .mini-dialog .md-body { padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 10px; }
+.consent-dialog { width: min(460px, 92vw); }
+.consent-dialog .md-body p { margin: 0; font-size: 13.5px; line-height: 1.5; color: var(--ink-soft); }
+.consent-dialog .consent-link { font-size: 13px; }
 .unassign-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .unassign-row .mono { font-size: 12px; color: var(--ink-soft); }
 

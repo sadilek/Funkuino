@@ -36,7 +36,9 @@
  *   tools?: { ffmpeg?: ToolState }, prefs?: { librarySort?: "date"|"alpha", printType?: string },
  *   cards?: { printTypes?: PrintType[] },
  *   cardsBacklog?: { newCovers?: number, perPage?: number } }} StatePayload
- * @typedef {{ id: string, label: string }} PrintType
+ * @typedef {{ title: string, text: string[], url: string, linkText?: string }} PrintNotice
+ * @typedef {{ id: string, label: string, page?: boolean, notice?: PrintNotice|null,
+ *   consented?: boolean }} PrintType
  * @typedef {{ phase: "probe"|"download"|"merge"|"done", item?: number, total?: number,
  *   title?: string, bytes?: number, bytesTotal?: number|null, ts?: number }} IntakeProgress
  * @typedef {{ id: string, fileOrUrl: string, playMode: number, unitId: string|null }} Assignment
@@ -825,16 +827,18 @@ async function printSelected() {
     .filter(u => PrintSel.has(u.id) && u.cover && u.cover.status === "present")
     .map(u => /** @type {string} */ (u.cover && u.cover.rel));
   if (!rels.length) return;
+  // The render request returns only once the job is done, and its log streams
+  // in meanwhile: clear the pane before, never after (that wiped an order's
+  // page and its failed cards the moment they had arrived).
+  startCardsLog(rels.length + " Karten werden gedruckt…");
+  const picked = new Set(PrintSel);
+  PrintSel.clear();
+  renderLibrary(); renderPrintBar();
   try {
     await api("/api/cards/render", "POST", { rels, printType: State.printType });
-    $("#cards-log").replaceChildren();
-    setCardsRunning(true);
-    PrintSel.clear();
-    renderLibrary(); renderPrintBar();
-    toast("Druck gestartet", "ok");
   } catch (/** @type {any} */ e) {
-    if (e.status === 409) toast("Es läuft bereits ein Karten-Vorgang.");
-    else toast("Drucken fehlgeschlagen: " + e.message);
+    cardsRequestFailed(e, "Drucken");
+    if (e.status !== 409) { picked.forEach(id => PrintSel.add(id)); renderLibrary(); renderPrintBar(); }
   }
 }
 
@@ -1265,17 +1269,35 @@ function clearSelection() {
 async function renderCardsPage() {
   if (State.cardsRunning || !Cards.selection.length) return;
   const rels = Cards.selection.slice();
+  startCardsLog(rels.length + " Karten werden gedruckt…");   // before: see printSelected
+  Cards.selection = [];          // consumed; printed state arrives via reload
+  renderCoversGrid();
   try {
     await api("/api/cards/render", "POST", { rels, printType: State.printType });
-    $("#cards-log").replaceChildren();
-    setCardsRunning(true);
-    appendLog("cards-log", rels.length + " Karten werden gedruckt…");
-    Cards.selection = [];          // consumed; printed state arrives via reload
-    renderCoversGrid();
   } catch (/** @type {any} */ e) {
-    if (e.status === 409) toast("Es läuft bereits ein Karten-Vorgang.");
-    else toast("Seite erzeugen fehlgeschlagen: " + e.message);
+    cardsRequestFailed(e, State.printPage ? "Seite erzeugen" : "Bestellen");
+    if (e.status !== 409) { Cards.selection = rels; renderCoversGrid(); }
   }
+}
+
+/** A picker job starts: fresh log, buttons locked until cards.done.
+ *  @param {string} line */
+function startCardsLog(line) {
+  $("#cards-log").replaceChildren();
+  appendLog("cards-log", line);
+  const out = /** @type {HTMLDetailsElement|null} */ (document.querySelector("details.cards-output"));
+  if (out) out.open = true;
+  setCardsRunning(true);
+}
+
+/** A picker request the server refused (a running job ends with cards.done
+ *  instead, which also unlocks the buttons).
+ *  @param {any} e @param {string} label */
+function cardsRequestFailed(e, label) {
+  if (e.status === 409) { toast("Es läuft bereits ein Karten-Vorgang."); return; }
+  if (State.cardsRunning) setCardsRunning(false);
+  appendLog("cards-log", label + " fehlgeschlagen: " + e.message);
+  toast(label + " fehlgeschlagen: " + e.message);
 }
 
 /* =============================== 8. Agent =============================== */
@@ -2113,15 +2135,70 @@ function initSyncCards() {
   $("#cards-undo").addEventListener("click", () => cardsAction("/api/cards/undo", {}, "Rückgängig"));
   $("#pick-clear").addEventListener("click", clearSelection);
   $("#pick-render").addEventListener("click", renderCardsPage);
-  $("#print-type").addEventListener("change", (/** @type {any} */ e) => {
-    State.printType = e.target.value;
-    State.printPage = printTypeInfo(State.printType).page;
+  $("#print-type").addEventListener("change", (/** @type {any} */ e) => choosePrintType(e.target.value));
+  $("#consent-accept").addEventListener("click", () => closeConsent(true));
+  $("#consent-decline").addEventListener("click", () => closeConsent(false));
+  $("#consent-dialog").addEventListener("cancel", (/** @type {Event} */ e) => { e.preventDefault(); closeConsent(false); });
+}
+
+/** Switch the print medium. One that sends the covers to somebody else's
+ *  server asks first, once: declined, the select goes back to what it was.
+ *  The server stores the choice and the consent together (and refuses the
+ *  medium without it), so the consent is not a browser-local flag.
+ *  @param {string} id */
+async function choosePrintType(id) {
+  const info = printTypeInfo(id);
+  let consent = false;
+  if (info.notice && !info.consented) {
+    consent = await askPrintConsent(info);
+    if (!consent) { renderPrintType(); return; }
+  }
+  try {
+    await api("/api/prefs", "POST", consent ? { printType: id, consent: true } : { printType: id });
+  } catch (/** @type {any} */ err) {
+    toast("Drucker nicht gespeichert: " + err.message);
     renderPrintType();
-    renderPickerBar();                     // counter and button follow the medium
-    if (isTabActive("karten")) loadCovers();
-    api("/api/prefs", "POST", { printType: State.printType })
-      .catch((/** @type {any} */ err) => toast("Drucker nicht gespeichert: " + err.message));
+    return;
+  }
+  if (consent) info.consented = true;
+  State.printType = id;
+  State.printPage = info.page !== false;
+  renderPrintType();
+  renderPickerBar();                     // counter and button follow the medium
+  if (isTabActive("karten")) loadCovers();
+}
+
+/** @type {((ok: boolean) => void)|null} */
+let consentResolve = null;
+
+/** Show a medium's third-party notice; resolves true for "Okay, Dienst nutzen".
+ *  @param {PrintType} info @returns {Promise<boolean>} */
+function askPrintConsent(info) {
+  const notice = /** @type {PrintNotice} */ (info.notice);
+  $("#consent-title").textContent = notice.title;
+  const link = el("a", {
+    class: "consent-link", href: notice.url, target: "_blank", rel: "noopener",
+    text: "Zum Dienst: " + (notice.linkText || notice.url),
+    // Opened by Studio itself: the macOS app's web view opens no new windows.
+    onclick: (/** @type {MouseEvent} */ e) => {
+      e.preventDefault();
+      api("/api/cards/notice-open", "POST", { printType: info.id })
+        .catch((/** @type {any} */ err) => toast("Konnte die Seite nicht öffnen: " + err.message));
+    },
   });
+  $("#consent-body").replaceChildren(...notice.text.map(t => el("p", { text: t })), link);
+  const dlg = /** @type {HTMLDialogElement} */ ($("#consent-dialog"));
+  if (!dlg.open) dlg.showModal();
+  return new Promise(resolve => { consentResolve = resolve; });
+}
+
+/** @param {boolean} ok */
+function closeConsent(ok) {
+  const dlg = /** @type {HTMLDialogElement} */ ($("#consent-dialog"));
+  if (dlg.open) dlg.close();
+  const resolve = consentResolve;
+  consentResolve = null;
+  if (resolve) resolve(ok);
 }
 
 /** The chosen medium's entry, with a paper-shaped fallback while state loads.
