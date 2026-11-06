@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 32" width="160" height="32">
+  <!-- Funkuino Studio's wordmark: the header's three wave bars (.wave i) beside the name. -->
+  <g fill="#e7753a">
+    <rect x="1" y="16" width="4.5" height="9" rx="2.25"/>
+    <rect x="8.5" y="4" width="4.5" height="21" rx="2.25"/>
+    <rect x="16" y="11.5" width="4.5" height="13.5" rx="2.25"/>
+  </g>
+  <text x="29" y="25" fill="#e6e1d9" font-family="'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif" font-size="27" font-weight="600">Funkuino</text>
+</svg>

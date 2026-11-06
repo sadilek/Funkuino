@@ -1,0 +1,49 @@
+/*
+ * The look of Funkuino's shared demo pages: Obeya puts this file into every page and the overview
+ * after its own style, so what is set here wins. Files named here with url() or @import go in when
+ * they lie in .obeya/ beside this file; anything else is dropped. Which parts of the pages a theme
+ * can style: the chapter "Sharing demos" (A repository's theme) of Obeya's design doc.
+ *
+ * The colours are Funkuino Studio's (scripts/studio_web/style.css, its "radio workshop" theme:
+ * warm paper, ink and a persimmon accent), converted from oklch to hex. The Studio variable each
+ * one comes from is named beside it; keep them in step when Studio's palette changes.
+ */
+
+:root {
+  --bg: #f3ede6;     /* the page behind everything (Studio's --paper) */
+  --card: #faf6f0;   /* the overview's entries, the search field, the chapter under the video's playhead (--surface) */
+  --ink: #2c2622;    /* text, the title (--ink) */
+  --muted: #5b544f;  /* secondary text: who shared it when, the dates in the overview, chapter times, the closing line (--ink-soft) */
+  --line: #dbd4cb;   /* borders: the overview's entries, the search field, the line above a later version (--line) */
+  --chip: #ebe5dc;   /* the tags, the chapter list's background, the tags in the overview (--surface-2) */
+  --accent: #b24b13; /* links, a hovered or focused entry, a chosen filter chip: Studio's --accent
+                        (#be5621) a shade darker, which as link text on --bg reached only 4.0:1 */
+}
+
+/* Titles in Studio's display serif, as its header wordmark (system fonts only, nothing loads). */
+h1, h2, ul.demos b {
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+}
+
+/* The wordmark above every page and the overview: the header's wave bars and the name. */
+main::before {
+  content: '';
+  display: block;
+  height: 32px;
+  margin-bottom: 20px;
+  background: url('logo.svg') left center / contain no-repeat;
+}
+
+/* The same for a reader whose system is set to dark (Studio's dark palette). */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #18130f;     /* --paper */
+    --card: #211b16;   /* --surface */
+    --ink: #e6e1d9;    /* --ink */
+    --muted: #b1aaa2;  /* --ink-soft */
+    --line: #39322b;   /* --line */
+    --chip: #2c251f;   /* --surface-2 */
+    --accent: #e7753a; /* --accent, unchanged: 6.2:1 on --bg */
+  }
+  main::before { background-image: url('logo-dark.svg'); }
+}
