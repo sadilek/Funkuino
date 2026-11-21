@@ -460,6 +460,20 @@ body.scrolled #lib-head { box-shadow: 0 7px 8px -7px oklch(0.3 0.02 66 / .35); }
 }
 .logpane:empty::before { content: "Noch keine Ausgabe."; color: var(--ink-faint); }
 .logpane .err { color: var(--accent); }
+/* The adopt offer (a pre-filled box): a question, so it waits in the panel
+   until it is answered rather than timing out like a toast. */
+.sync-offer {
+  margin-top: 14px; padding: 12px 14px;
+  border: 1px solid color-mix(in oklch, var(--warn) 55%, var(--line));
+  border-radius: var(--radius);
+  background: color-mix(in oklch, var(--warn) 12%, var(--surface));
+  font-size: 14px;
+  animation: rbIn .28s var(--ease);
+}
+.sync-offer .so-title { font-weight: 600; margin-bottom: 4px; }
+.sync-offer p { margin: 0 0 8px; }
+.sync-offer .so-warn { font-size: 13px; color: var(--ink-soft); }
+.sync-offer .btn-row { margin-top: 10px; }
 .stats-line { margin-top: 10px; font-family: var(--font-mono); font-size: 12px; color: var(--ink-soft); }
 
 /* ---------- Agent ---------- */

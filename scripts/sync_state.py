@@ -79,6 +79,19 @@ class SyncState:
         espuino.write_text_atomically(
             self.path, json.dumps(payload, indent=1, ensure_ascii=False))
 
+    @property
+    def knows_own_uploads(self) -> bool:
+        """Whether a device file missing from this manifest was put there by
+        someone else (a card filled at a computer, the device's web UI).
+
+        True for a manifest that loaded cleanly or does not exist yet: every
+        upload of ours writes a pending marker before it starts, so one we
+        broke off is in the manifest. Not for a recovered or lost one, which
+        may have lost those markers: a file it lacks may be our own truncated
+        upload, so Studio does not offer to adopt it.
+        """
+        return self.load_status in ("ok", "missing")
+
     def get(self, remote_path: str) -> dict | None:
         return self.files.get(remote_path)
 

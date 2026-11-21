@@ -97,6 +97,8 @@ def _sync_summary(stats, elapsed: float, dry_run: bool) -> str:
     uploaded = stats.added + stats.updated + stats.resumed
     parts = [f"{uploaded} hochgeladen", f"{stats.deleted} gelöscht",
              f"{stats.skipped} unverändert"]
+    if stats.seeded:
+        parts.insert(1, f"{stats.seeded} übernommen")
     if stats.failed:
         parts.append(f"{stats.failed} fehlgeschlagen")
     line = f"Fertig in {_de_secs(elapsed)} s: " + ", ".join(parts)
@@ -869,16 +871,23 @@ class Studio:
                 {"error": "Einzel-Sync läuft noch"}, status=409)
         dry_run = bool(body.get("dryRun"))
         delete = bool(body.get("delete"))
+        # Files already on the box that Studio never uploaded (a card filled
+        # at a computer): adopt them only on the user's explicit choice.
+        # true = adopt, false = upload them anyway, absent = ask first.
+        adopt = body.get("adopt")
+        if adopt is not None and not isinstance(adopt, bool):
+            return web.json_response({"error": "adopt muss true/false sein"}, status=400)
         # A real delete needs explicit confirmation; a delete *dry-run* only
         # previews would-be deletions and is harmless, so it doesn't.
         if delete and not dry_run and not body.get("confirm"):
             return web.json_response(
                 {"error": "Löschen erfordert confirm:true"}, status=400)
         self.sync_running = True
-        self.loop.create_task(self._run_sync(dry_run, delete))
+        self.loop.create_task(self._run_sync(dry_run, delete, adopt))
         return web.json_response({"started": True, "dryRun": dry_run})
 
-    async def _run_sync(self, dry_run: bool, delete: bool) -> None:
+    async def _run_sync(self, dry_run: bool, delete: bool,
+                        adopt: bool | None = None) -> None:
         start = time.monotonic()
         try:
             dev = self.active
@@ -896,10 +905,28 @@ class Studio:
                 def log(line: str) -> None:
                     self.emit_threadsafe({"t": "sync.log", "line": line})
 
+                # Asked only where a missing manifest entry really means
+                # "not ours" (see SyncState.knows_own_uploads).
+                offer = adopt is None and state.knows_own_uploads
                 stats = await self.loop.run_in_executor(
                     None, lambda: sync.mirror(client, dev.cfg, state,
                                               delete=delete, dry_run=dry_run,
-                                              log=log))
+                                              adopt_existing=adopt is True,
+                                              offer_adopt=offer, log=log))
+            offer_msg = None
+            if offer and stats.adoptable:
+                offer_msg = {"t": "sync.offer", "count": stats.adoptable,
+                             "bytes": stats.adoptable_bytes, "files": stats.files,
+                             "delete": delete, "dryRun": dry_run,
+                             "device": dev.label}
+            if stats.adopt_offered:
+                # Stopped after the listing: nothing was uploaded or deleted.
+                self.emit({"t": "sync.log", "line":
+                           f"{stats.adoptable} von {stats.files} Dateien liegen schon "
+                           "auf der Kiste, Studio hat sie aber nie hochgeladen. "
+                           "Noch nichts übertragen — bitte wählen."})
+                self.emit(offer_msg)
+                return
             # A quiet run produces no further mirror log lines and the closing
             # "Done in Xs" summary only lives in sync.main(), so emit our own
             # closing line here (before sync.done) so the log pane isn't left
@@ -912,6 +939,8 @@ class Studio:
             payload["uploaded"] = stats.added + stats.updated + stats.resumed
             payload["bytes"] = stats.bytes_sent
             self.emit({"t": "sync.done", "stats": payload})
+            if offer_msg:
+                self.emit(offer_msg)   # after a dry run: the same question
         except Exception as exc:  # noqa: BLE001
             elapsed = time.monotonic() - start
             self.emit({"t": "sync.log",

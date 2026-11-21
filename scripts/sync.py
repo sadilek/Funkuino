@@ -71,10 +71,40 @@ class Stats:
     deleted: int = 0
     failed: int = 0
     bytes_sent: int = 0
+    files: int = 0              # local files considered
+    adoptable: int = 0          # on the device, but not in our manifest
+    adoptable_bytes: int = 0
+    adopt_offered: bool = False  # stopped before any upload, see offer_adopt
+
+
+def _local_files(local_root: Path, remote_root: str):
+    """(local path, remote path, size, mtime) of every file to mirror."""
+    for dirpath, dirnames, filenames in os.walk(local_root):
+        dirnames[:] = sorted(d for d in dirnames if not espuino.is_ignored(d))
+        rel_dir = os.path.relpath(dirpath, local_root)
+        remote_dir = (
+            remote_root
+            if rel_dir == "."
+            else espuino.join_remote(remote_root, *Path(rel_dir).parts)
+        )
+        for fname in sorted(filenames):
+            if espuino.is_ignored(fname):
+                continue
+            local_path = os.path.join(dirpath, fname)
+            yield (local_path, espuino.join_remote(remote_dir, fname),
+                   os.path.getsize(local_path), int(os.path.getmtime(local_path)))
 
 
 def mirror(client: espuino.ESPuino, cfg: espuino.Config, state: SyncState,
-           delete: bool, dry_run: bool, adopt_existing: bool = False, log=print) -> Stats:
+           delete: bool, dry_run: bool, adopt_existing: bool = False,
+           offer_adopt: bool = False, log=print) -> Stats:
+    """Mirror cfg.local_dir onto the device.
+
+    ``offer_adopt`` (Studio): if files the manifest does not know are already
+    on the device, return right after the listing with ``adopt_offered`` set,
+    before anything is uploaded, so the user can choose between adopting them
+    and uploading everything. A dry run always completes and only counts them.
+    """
     local_root = Path(cfg.local_dir)
     if not local_root.is_dir():
         raise RuntimeError(f"Local directory does not exist: {local_root}")
@@ -83,74 +113,67 @@ def mirror(client: espuino.ESPuino, cfg: espuino.Config, state: SyncState,
     remote_files, remote_dirs = client.remote_index(cfg.remote_root)
 
     stats = Stats()
-    local_files: set[str] = set()
+    plan = list(_local_files(local_root, cfg.remote_root))
+    local_files: set[str] = {remote for _, remote, _, _ in plan}
+    stats.files = len(plan)
+    for _, remote_path, size, _ in plan:
+        if state.get(remote_path) is None and remote_path in remote_files:
+            stats.adoptable += 1
+            stats.adoptable_bytes += size
+    if offer_adopt and stats.adoptable and not adopt_existing and not dry_run:
+        stats.adopt_offered = True
+        return stats
 
-    for dirpath, dirnames, filenames in os.walk(local_root):
-        dirnames[:] = sorted(d for d in dirnames if not espuino.is_ignored(d))
-        rel_dir = os.path.relpath(dirpath, local_root)
-        remote_dir = (
-            cfg.remote_root
-            if rel_dir == "."
-            else espuino.join_remote(cfg.remote_root, *Path(rel_dir).parts)
-        )
+    for local_path, remote_path, size, mtime in plan:
+        exists = remote_path in remote_files
+        entry = state.get(remote_path)
 
-        for fname in sorted(filenames):
-            if espuino.is_ignored(fname):
-                continue
-            local_path = os.path.join(dirpath, fname)
-            remote_path = espuino.join_remote(remote_dir, fname)
-            local_files.add(remote_path)
-
-            size = os.path.getsize(local_path)
-            mtime = int(os.path.getmtime(local_path))
-            exists = remote_path in remote_files
-            entry = state.get(remote_path)
-
-            if state.is_unchanged(remote_path, size, mtime):
-                stats.skipped += 1
-                continue
-            if entry is None and exists and adopt_existing:
-                # Only with --adopt-existing: trust a pre-populated device's file
-                # as complete without uploading. Off by default, because we
-                # cannot verify a remote file is not a truncated leftover.
-                if not dry_run:
-                    state.adopt(remote_path, size, mtime)
-                stats.seeded += 1
-                continue
-
-            # Needs upload: new, changed, or a pending (interrupted) upload.
-            if state.is_pending(remote_path):
-                action = "resume"
-            elif exists:
-                action = "update"
-            else:
-                action = "add"
-            log(f"  {action:>6}  {remote_path}  ({size:,} B)")
+        if state.is_unchanged(remote_path, size, mtime):
+            stats.skipped += 1
+            continue
+        if entry is None and exists and adopt_existing:
+            # Only on an explicit choice (--adopt-existing, Studio's offer):
+            # trust a pre-populated device's file as complete without
+            # uploading. Never by default, because we cannot verify a
+            # remote file is not a truncated leftover.
             if not dry_run:
-                # Persist intent BEFORE the upload and success AFTER, so an
-                # interrupted upload is re-tried next run (never trusted as done).
-                state.mark_pending(remote_path)
-                prog = _make_progress(remote_path, size)
-                try:
-                    client.upload(local_path, remote_path, progress=prog)
-                except Exception as exc:  # noqa: BLE001
-                    if prog:
-                        print()
-                    # Leave the pending marker so the next run retries this file;
-                    # don't abort the whole sync for one bad upload.
-                    log(f"  FAILED  {remote_path}: {exc}")
-                    stats.failed += 1
-                    continue
+                state.adopt(remote_path, size, mtime)
+            stats.seeded += 1
+            continue
+
+        # Needs upload: new, changed, or a pending (interrupted) upload.
+        if state.is_pending(remote_path):
+            action = "resume"
+        elif exists:
+            action = "update"
+        else:
+            action = "add"
+        log(f"  {action:>6}  {remote_path}  ({size:,} B)")
+        if not dry_run:
+            # Persist intent BEFORE the upload and success AFTER, so an
+            # interrupted upload is re-tried next run (never trusted as done).
+            state.mark_pending(remote_path)
+            prog = _make_progress(remote_path, size)
+            try:
+                client.upload(local_path, remote_path, progress=prog)
+            except Exception as exc:  # noqa: BLE001
                 if prog:
-                    print()  # finish the progress-bar line
-                state.mark_synced(remote_path, size, mtime)
-            if action == "add":
-                stats.added += 1
-            elif action == "update":
-                stats.updated += 1
-            else:
-                stats.resumed += 1
-            stats.bytes_sent += size
+                    print()
+                # Leave the pending marker so the next run retries this file;
+                # don't abort the whole sync for one bad upload.
+                log(f"  FAILED  {remote_path}: {exc}")
+                stats.failed += 1
+                continue
+            if prog:
+                print()  # finish the progress-bar line
+            state.mark_synced(remote_path, size, mtime)
+        if action == "add":
+            stats.added += 1
+        elif action == "update":
+            stats.updated += 1
+        else:
+            stats.resumed += 1
+        stats.bytes_sent += size
 
     if delete:
         _delete_extras(client, state, remote_files, remote_dirs, local_files,
@@ -259,6 +282,11 @@ def main(argv: list[str] | None = None) -> int:
         f"{stats.skipped} unchanged, {stats.deleted} deleted, "
         f"{stats.failed} failed, {stats.bytes_sent / 1_048_576:.1f} MiB sent."
     )
+    if args.dry_run and stats.adoptable and not args.adopt_existing:
+        print(f"NOTE: {stats.adoptable} file(s) listed as 'update' are already on the device but "
+              "were never uploaded by this tool (e.g. a card filled at a computer). "
+              "If they are complete copies, --adopt-existing takes them over "
+              "instead of uploading them again.")
     if stats.failed:
         print(f"NOTE: {stats.failed} file(s) failed and stay pending; run ./sync again to retry.",
               file=sys.stderr)

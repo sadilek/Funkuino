@@ -55,6 +55,7 @@
  *   | {k:"resolved",requestId:string,label:string,expired?:boolean} | {k:"notice",text:string}} AgentEvent
  * @typedef {(
  *   {t:"sync.log",line?:string} | {t:"sync.done",stats?:any} | {t:"sync.error",msg?:string}
+ *   | {t:"sync.offer",count:number,bytes:number,files:number,delete:boolean,dryRun:boolean,device:string}
  *   | {t:"cards.log",line?:string} | {t:"cards.done",code?:number}
  *   | {t:"unit.sync",id:string,status:"running"|"progress"|"done"|"error",pct?:number,line?:string,error?:string}
  *   | {t:"intake.progress",sessionId:string,progress:IntakeProgress}
@@ -261,6 +262,7 @@ function handleWsEvent(m) {
   switch (m.t) {
     case "sync.log":    appendLog("sync-log", m.line); break;
     case "sync.done":   onSyncDone(m.stats); break;
+    case "sync.offer":  showAdoptOffer(m); break;
     case "sync.error":  appendLog("sync-log", m.msg, true); setSyncRunning(false); toast(m.msg || "Sync-Fehler"); break;
     case "cards.log":   appendLog("cards-log", m.line); break;
     case "cards.done":  onCardsDone(m.code); break;
@@ -1227,6 +1229,7 @@ async function selectDevice(id) {
   try {
     await api("/api/device/select", "POST", { id });
     toast("Kiste gewechselt: " + d.label, "ok");
+    hideAdoptOffer();   // it was about the other box
     State.player = null;
     await refreshState();
   } catch (/** @type {any} */ e) { toast(e.message); }
@@ -1354,6 +1357,7 @@ function onSyncDone(stats) {
   if (stats && typeof stats === "object") {
     const bits = [];
     if (stats.uploaded != null) bits.push(stats.uploaded + " hochgeladen");
+    if (stats.seeded) bits.push(stats.seeded + " übernommen");
     if (stats.deleted != null) bits.push(stats.deleted + " gelöscht");
     if (stats.skipped != null) bits.push(stats.skipped + " übersprungen");
     if (stats.bytes != null) bits.push(fmtBytes(stats.bytes));
@@ -1364,22 +1368,69 @@ function onSyncDone(stats) {
   toast("Sync abgeschlossen", "ok");
 }
 
-/** @param {boolean} dryRun @param {boolean} del */
-async function startSync(dryRun, del) {
+/** @param {boolean} dryRun @param {boolean} del
+ *  @param {boolean} [adopt] the answer to the adopt offer; left out = ask
+ *  @param {boolean} [confirmed] a delete the user already confirmed */
+async function startSync(dryRun, del, adopt, confirmed) {
   if (State.syncRunning) return;
   // A real delete needs confirmation; a dry-run with delete only previews it.
-  if (del && !dryRun && !confirm("Sync mit Löschen entfernt Dateien auf dem Gerät, die lokal fehlen. Fortfahren?")) return;
+  if (del && !dryRun && !confirmed && !confirm("Sync mit Löschen entfernt Dateien auf dem Gerät, die lokal fehlen. Fortfahren?")) return;
+  hideAdoptOffer();
   $("#sync-log").replaceChildren();
   $("#sync-stats").textContent = "";
   setSyncRunning(true);
+  /** @type {Record<string, boolean>} */
+  const body = { dryRun: !!dryRun, delete: !!del, confirm: !!del };
+  if (adopt != null) body.adopt = adopt;
+  // Before the request: the job's first log lines can arrive over the
+  // websocket before the POST returns, which put this line below them.
+  appendLog("sync-log", (dryRun ? "Dry-Run" : del ? "Sync mit Löschen" : "Sync") +
+    (adopt ? " (vorhandene Dateien übernehmen)" : "") + " gestartet…");
   try {
-    await api("/api/sync", "POST", { dryRun: !!dryRun, delete: !!del, confirm: !!del });
-    appendLog("sync-log", (dryRun ? "Dry-Run" : del ? "Sync mit Löschen" : "Sync") + " gestartet…");
+    await api("/api/sync", "POST", body);
   } catch (/** @type {any} */ e) {
+    appendLog("sync-log", "Nicht gestartet: " + e.message, true);
     setSyncRunning(false);
     if (e.status === 409) toast("Es läuft bereits ein Sync.");
     else toast("Sync-Start fehlgeschlagen: " + e.message);
   }
+}
+
+// -- adopting a pre-filled box --
+// A box whose SD card was filled at a computer holds the library already, but
+// Studio has no record of uploading it, so a sync would send every file again.
+// The server stops such a sync after the listing (a dry run runs to the end)
+// and asks here. Adopting trusts the files unseen, so it is only ever this
+// explicit choice; the warning says what the user vouches for.
+
+/** @param {{count:number,bytes:number,files:number,delete:boolean,dryRun:boolean,device:string}} m */
+function showAdoptOffer(m) {
+  setSyncRunning(false);
+  const box = $("#sync-offer");
+  const all = m.count === m.files;
+  const what = (all ? "Alle " + m.files : m.count + " von " + m.files) + " Dateien";
+  const del = !m.dryRun && m.delete;   // a confirmed "Sync mit Löschen" keeps its delete
+  const go = (/** @type {boolean} */ adopt) => startSync(false, del, adopt, true);
+  box.replaceChildren(
+    el("div", { class: "so-title", text: "Schon auf der Kiste" + (m.device ? " „" + m.device + "“" : "") }),
+    el("p", { text: what + " (" + fmtBytes(m.bytes) + ") liegen dort bereits am richtigen Ort, " +
+      "wurden aber nie von Studio hochgeladen – etwa weil die SD-Karte direkt am Computer befüllt wurde. " +
+      (m.dryRun ? "Ein Sync würde sie alle neu übertragen." : "Noch ist nichts übertragen.") }),
+    el("p", { class: "so-warn", text: "Übernehmen heißt: Studio vertraut darauf, dass diese Dateien vollständig sind, " +
+      "und lädt nur den Rest hoch. Prüfen kann es das nicht – nur übernehmen, wenn das Kopieren fertig war." }),
+    el("div", { class: "btn-row" },
+      el("button", { class: "btn primary", type: "button", text: "Übernehmen und synchronisieren", onclick: () => go(true) }),
+      el("button", { class: "btn", type: "button", text: "Alle neu hochladen", onclick: () => go(false) }),
+      el("button", { class: "btn", type: "button", text: m.dryRun ? "Schließen" : "Abbrechen", onclick: hideAdoptOffer })),
+  );
+  box.hidden = false;
+  if (!m.dryRun) $("#sync-stats").textContent = "Wartet auf Entscheidung – nichts übertragen.";
+}
+
+function hideAdoptOffer() {
+  const box = $("#sync-offer");
+  box.hidden = true;
+  box.replaceChildren();
 }
 
 async function pingDevice() {

@@ -267,6 +267,21 @@ after its upload *confirmably* completed:
   pre-populated library) is **off by default** — we cannot verify such a file is
   not a truncated leftover, so we re-upload it. Pass `--adopt-existing` only for
   the deliberate one-time seeding of a device already known to hold good files.
+* **Studio asks instead of guessing** (a box whose SD card was filled at a
+  computer). `mirror()` counts the device files the manifest has no entry for
+  (`Stats.adoptable`); with `offer_adopt` a real run returns right after the
+  listing, before the first upload, with `adopt_offered` set, and Studio's Sync
+  tab shows "N von M Dateien liegen dort bereits …" with *Übernehmen und
+  synchronisieren* (`POST /api/sync {"adopt": true}` = `--adopt-existing`),
+  *Alle neu hochladen* (`adopt: false`) and *Abbrechen*. A dry run runs to the
+  end and asks the same afterwards. It asks whenever such files exist, not
+  only for an empty manifest: a unit uploaded from the Bibliothek first would
+  otherwise have made the question never come. It does **not** ask when the
+  manifest was recovered from its `.bak` or lost
+  (`SyncState.knows_own_uploads`): only a cleanly loaded manifest guarantees
+  that a file it lacks is not one of our own interrupted uploads, since those
+  always leave a pending marker. The CLI's dry run points at
+  `--adopt-existing` in the same situation.
 
 **Large files.** The device writes to SD slower than the network delivers, so a
 big POST body fills the TCP window and the send blocks; a fixed short timeout
@@ -515,7 +530,8 @@ One localhost web app (default `http://127.0.0.1:8800`) covering the whole workf
 the status boxes are also the actions: Sync-box uploads the unit, Druck-box
 selects for printing via a floating print bar, Karte-box assigns/unassigns RFID
 cards), **Agent**, **Sync** (mirror with live log; Dry-Run always previews
-`--delete`), **Kartendruck** (the full card picker, integrated; sheets are
+`--delete`; a pre-filled box gets the adopt question, see *How the mirror
+works*), **Kartendruck** (the full card picker, integrated; sheets are
 `./cards --undo`-compatible).
 
 - **Settings dialog** (gear in the header, `GET`/`POST /api/settings`): device
