@@ -16,6 +16,7 @@ the repo uses (``espuino.join_remote``/``is_ignored``, ``sync_state``,
 
 from __future__ import annotations
 
+import json
 import os
 import unicodedata
 from pathlib import Path
@@ -25,22 +26,42 @@ from print_state import PrintState, _key
 from sync_state import SyncState
 
 
-def pick_manifest(state_dir: str | Path) -> tuple[SyncState | None, dict | None]:
-    """The newest upload manifest in ``state_dir`` (there is one per device).
+def pick_manifest(state_dir: str | Path, mac: str = "", host: str = "",
+                  newest_fallback: bool = True) -> tuple[SyncState | None, dict | None]:
+    """The upload manifest of one device (there is one per device MAC).
+
+    By ``mac`` when it is known; else the manifest last written for ``host``;
+    else, with ``newest_fallback`` (a single configured device), the newest
+    one -- how Studio picked it before there could be several devices.
 
     Returns ``(state, meta)`` where meta is ``{host, deviceId, fileMtime}``, or
-    ``(None, None)`` if no manifest exists yet (fresh checkout / never synced)."""
+    ``(None, None)`` if there is none yet (fresh checkout / never synced)."""
     state_dir = Path(state_dir)
     # `sync-<mac>.json`, not every .json: the status folder holds the print
     # history as well, and picking that up would report "never synced".
     candidates = sorted(state_dir.glob("sync-*.json"),
                         key=lambda p: p.stat().st_mtime, reverse=True)
-    if not candidates:
+    chosen = None
+    if mac:
+        chosen = next((p for p in candidates
+                       if p.name == SyncState.file_name(mac)), None)
+    if chosen is None and host:
+        # Peek only: a broken file is left for SyncState.load to deal with.
+        for path in candidates:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("host") == host:
+                chosen = path
+                break
+    if chosen is None and newest_fallback and candidates:
+        chosen = candidates[0]
+    if chosen is None:
         return None, None
-    newest = candidates[0]
-    state = SyncState.load(state_dir, device_id=newest.stem.removeprefix("sync-"))
+    state = SyncState.load(state_dir, device_id=chosen.stem.removeprefix("sync-"))
     meta = {"host": state.host, "deviceId": state.device_id,
-            "fileMtime": newest.stat().st_mtime}
+            "fileMtime": chosen.stat().st_mtime}
     return state, meta
 
 
@@ -54,11 +75,11 @@ DEFAULT_PLAYMODE = {"song": 1, "hoerspiel": 3, "album": 5, "folge": 5, "other": 
 
 
 def assignment_key(file_or_url: str, remote_root: str = espuino.DEFAULT_REMOTE_ROOT) -> str:
-    """An RFID assignment's ``fileOrUrl`` -> unit-id key, so it can be matched
-    against a unit's ``id``: the path relative to ``remote_root`` (the inverse
-    of join_remote), NFC-normalised. A path outside ``remote_root`` gets ""
-    and so matches no unit -- stripped of nothing, "/Lieder/x.mp3" would claim
-    the unit "Lieder/x.mp3" that actually lives at "/mp3/Lieder/x.mp3"."""
+    """A device path (e.g. a trackinfo name) -> unit-id key: the path relative
+    to ``remote_root`` (the inverse of join_remote), NFC-normalised. A path
+    outside ``remote_root`` gets "" and so matches no unit -- stripped of
+    nothing, "/Lieder/x.mp3" would claim the unit "Lieder/x.mp3" that actually
+    lives at "/mp3/Lieder/x.mp3"."""
     s = _nfc(str(file_or_url or "").lstrip("/"))
     root = _nfc(str(remote_root or "").strip("/"))
     if not root:
@@ -66,15 +87,13 @@ def assignment_key(file_or_url: str, remote_root: str = espuino.DEFAULT_REMOTE_R
     return s[len(root) + 1:] if s.startswith(root + "/") else ""
 
 
-def build_card_map(assignments: list[dict],
-                   remote_root: str = espuino.DEFAULT_REMOTE_ROOT) -> dict[str, list[str]]:
-    """From ``GET /rfid`` entries, map unit-id key -> assigned card ids. Entries
-    whose path matches no unit are simply never looked up by :func:`scan`."""
+def build_card_map(cards: dict[str, dict]) -> dict[str, list[str]]:
+    """From the shared card table (rfid_cards), map unit-id key -> card ids.
+    Entries that name no unit are simply never looked up by :func:`scan`."""
     out: dict[str, list[str]] = {}
-    for a in assignments:
-        key = assignment_key(a.get("fileOrUrl", ""), remote_root)
-        if key:
-            out.setdefault(key, []).append(str(a.get("id")))
+    for tag, entry in sorted(cards.items()):
+        if entry.get("path"):
+            out.setdefault(_nfc(entry["path"]), []).append(tag)
     return out
 
 

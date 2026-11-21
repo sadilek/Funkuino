@@ -40,6 +40,7 @@ import fnmatch
 import json
 import os
 import posixpath
+import re
 import shutil
 import socket
 import subprocess
@@ -354,16 +355,19 @@ PRINT_SHEETS_DIR = DATA_ROOT / "print-sheets"
 # share a file with anything else.
 STATUS_DIR = DATA_ROOT / "status"
 PRINT_STATE_FILE = STATUS_DIR / "print-history.json"
+RFID_CARDS_FILE = STATUS_DIR / "rfid-cards.json"   # cards shared by all devices
 SYNC_STATE_DIR = STATUS_DIR
 
 STATUS_README = """Dieser Ordner gehört zur Funkuino-Mediathek.
 
-Hier merkt sich Funkuino, was bereits auf welchem ESPuino liegt und welche
-Karten schon gedruckt sind. Beim Verschieben oder Sichern der Mediathek also
+Hier merkt sich Funkuino, was bereits auf welchem ESPuino liegt, welche
+Karten schon gedruckt sind und welche Karte was abspielt (rfid-cards.json,
+für alle Geräte gemeinsam). Beim Verschieben oder Sichern der Mediathek also
 bitte mitnehmen.
 
 Verloren ist nichts, wenn er fehlt: der nächste Abgleich lädt dann alles erneut
-auf das Gerät, und im Kartendruck gelten wieder alle Cover als ungedruckt.
+auf das Gerät, im Kartendruck gelten wieder alle Cover als ungedruckt, und die
+Kartenzuordnungen werden von den Geräten neu eingelesen.
 """
 
 
@@ -529,18 +533,26 @@ class Config:
     http_password: Optional[str] = None
 
     @classmethod
-    def from_env(cls, **overrides) -> "Config":
+    def from_env(cls, device: str | None = None, **overrides) -> "Config":
         """Defaults, overlaid with the saved settings (config.json, and the
         HTTP password from credentials.env), then ESPUINO_* env vars, then
         explicit (non-None) keyword overrides (typically CLI arguments).
 
         The saved settings are what Studio's settings dialog writes, so a
-        device configured there is the one `funkuino sync` talks to as well.
+        device configured there is the one `funkuino sync` talks to as well:
+        the device chosen in Studio's switcher, or ``device`` (a saved
+        device's id or name). Base folder and login are shared by all devices.
         """
-        saved = {k: v for k, v in read_app_config().items() if isinstance(v, str) and v}
+        config = read_app_config()
+        saved = {k: v for k, v in config.items() if isinstance(v, str) and v}
         secrets = parse_env(credentials_file())
+        chosen = find_device(device, config) if device else active_device(config)
+        if chosen is None:
+            raise ValueError(f"Kein Gerät namens {device!r} eingerichtet.")
         cfg = cls(
-            host=os.environ.get("ESPUINO_HOST") or saved.get("host") or DEFAULT_HOST,
+            # A device asked for by name beats ESPUINO_HOST; only --host does.
+            host=(chosen["host"] if device else None)
+            or os.environ.get("ESPUINO_HOST") or chosen["host"],
             local_dir=Path(os.environ.get("ESPUINO_LOCAL_DIR", str(DEFAULT_LOCAL_DIR))),
             remote_root=(os.environ.get("ESPUINO_REMOTE_ROOT")
                          or saved.get("remote_root") or DEFAULT_REMOTE_ROOT),
@@ -556,7 +568,69 @@ class Config:
         return cfg
 
 
+# --- Devices ----------------------------------------------------------------
+# Several ESPuinos can share one library (one box per child). config.json then
+# holds them as ``devices: [{id, name, host}]`` plus ``active_device``, the
+# one Studio's switcher points at and every command talks to by default.
+# Without that list there is one device, from the older single ``host`` key,
+# so an existing installation keeps working untouched. ``host`` is kept equal
+# to the active device's address, for anything that reads only that key.
+# Base folder and login are shared by all devices.
+LEGACY_DEVICE_ID = "default"
+
+
+def saved_devices(config: dict | None = None) -> list[dict]:
+    """The configured devices, each ``{id, name, host}`` (never empty)."""
+    config = read_app_config() if config is None else config
+    out: list[dict] = []
+    raw = config.get("devices")
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        dev_id, host = entry.get("id"), entry.get("host")
+        if not (isinstance(dev_id, str) and dev_id and isinstance(host, str) and host):
+            continue
+        if any(d["id"] == dev_id for d in out):
+            continue
+        name = entry.get("name")
+        out.append({"id": dev_id, "host": host,
+                    "name": name.strip() if isinstance(name, str) else ""})
+    if out:
+        return out
+    host = config.get("host")
+    return [{"id": LEGACY_DEVICE_ID, "name": "",
+             "host": host if isinstance(host, str) and host else DEFAULT_HOST}]
+
+
+def active_device(config: dict | None = None) -> dict:
+    """The device the switcher points at (the first one if unset or gone)."""
+    config = read_app_config() if config is None else config
+    devices = saved_devices(config)
+    wanted = config.get("active_device")
+    return next((d for d in devices if d["id"] == wanted), devices[0])
+
+
+def find_device(key: str, config: dict | None = None) -> dict | None:
+    """A saved device by id or (case-insensitive) name."""
+    devices = saved_devices(config)
+    return (next((d for d in devices if d["id"] == key), None)
+            or next((d for d in devices if d["name"].casefold() == key.casefold()), None))
+
+
+def device_label(device: dict) -> str:
+    """What the UI and logs call a device: its name, else its address."""
+    return device.get("name") or device.get("host") or ""
+
+
 # --- Helpers ----------------------------------------------------------------
+def split_host(host: str, default_port: int = HTTP_PORT) -> tuple[str, int]:
+    """``name:port`` -> (name, port); a bare name (or an IPv6 address) keeps
+    the default port. A port lets a device sit behind a port forward -- and
+    dev/fake_espuino.py run several simulated boxes on one machine."""
+    m = re.fullmatch(r"([^:\[\]]+):(\d{1,5})", host or "")
+    return (m.group(1), int(m.group(2))) if m else (host, default_port)
+
+
 def is_ignored(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in IGNORE_PATTERNS)
 
@@ -602,8 +676,10 @@ class ESPuino:
         self.session = requests.Session()
         if cfg.http_user:
             self.session.auth = (cfg.http_user, cfg.http_password or "")
-        self._addr = self._resolve(cfg.host)
-        self.base = f"http://{self._addr}:{cfg.http_port}"
+        name, port = split_host(cfg.host, cfg.http_port)
+        self._addr = self._resolve(name)
+        self._port = port
+        self.base = f"http://{self._addr}:{port}"
 
     @staticmethod
     def _resolve(host: str) -> str:
@@ -733,7 +809,7 @@ class ESPuino:
         import websocket  # from the `websocket-client` package
 
         ws = websocket.create_connection(
-            f"ws://{self._addr}:{self.cfg.http_port}/ws", timeout=10
+            f"ws://{self._addr}:{self._port}/ws", timeout=10
         )
         try:
             ws.send(json.dumps({"controls": {"action": action}}))

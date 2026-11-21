@@ -168,6 +168,53 @@ html[data-shell="mac"] .wordmark {
 }
 .device-chip.online .led { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in oklch, var(--ok) 22%, transparent); }
 .device-chip.offline .led { background: var(--dot-muted); }
+.device-chip .chip-caret { font-family: var(--font-ui); font-size: 10px; color: var(--ink-faint); margin-left: -2px; }
+.device-chip[aria-expanded="true"] { border-color: var(--accent); color: var(--ink); }
+
+/* ---------- device switcher (several boxes on one library) ----------
+   A popover in the top layer, placed under the chip by app.js. */
+.device-menu {
+  position: fixed; inset: auto; margin: 0; min-width: 260px; max-width: min(360px, 92vw);
+  padding: 8px; border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--surface); color: var(--ink); box-shadow: var(--shadow);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .device-menu {
+    opacity: 0; translate: 0 -4px;
+    transition: opacity, translate, display, overlay;
+    transition-duration: .12s;
+    transition-behavior: allow-discrete;
+  }
+  .device-menu:popover-open {
+    opacity: 1; translate: 0 0; transition-duration: .1s;
+    @starting-style { opacity: 0; translate: 0 -4px; }
+  }
+}
+.device-menu .dm-title {
+  padding: 4px 8px 6px; font-size: 11px; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink-faint);
+}
+.device-menu .dm-items { display: flex; flex-direction: column; gap: 2px; }
+.dm-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px;
+  border: 0; border-radius: 6px; background: none; color: inherit; font: inherit;
+  text-align: left; cursor: pointer;
+}
+.dm-item:hover, .dm-item:focus-visible { background: var(--surface-2); outline: none; }
+.dm-item:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+.dm-item .led { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--dot-muted); }
+.dm-item.online .led { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in oklch, var(--ok) 22%, transparent); }
+.dm-item .dm-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+.dm-item .dm-text b { font-weight: 600; font-size: 13.5px; }
+.dm-item .dm-sub { font-family: var(--font-mono); font-size: 11px; color: var(--ink-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dm-item.active { background: color-mix(in oklch, var(--accent) 10%, transparent); }
+.dm-item.active .dm-text b::after { content: " ✓"; color: var(--accent); }
+.dm-pending {
+  flex: none; font-size: 11px; padding: 2px 7px; border-radius: 999px;
+  color: var(--warn); background: color-mix(in oklch, var(--warn) 14%, transparent);
+}
+.device-menu hr { border: 0; border-top: 1px solid var(--line-soft); margin: 8px 0 6px; }
+.device-menu .dm-foot { display: flex; justify-content: space-between; padding: 0 8px 2px; }
 
 .tabs {
   display: flex;
@@ -364,6 +411,11 @@ body.scrolled #lib-head { box-shadow: 0 7px 8px -7px oklch(0.3 0.02 66 / .35); }
   50% { border-color: var(--accent); box-shadow: 0 0 0 4px color-mix(in oklch, var(--accent) 0%, transparent); }
 }
 @media (prefers-reduced-motion: reduce) { .box.pulse { animation: none; border-color: var(--accent); } }
+/* An assigned card one of the boxes does not have yet (it was offline). */
+.box-wait {
+  position: absolute; bottom: -5px; right: -5px; width: 12px; height: 12px;
+  border-radius: 50%; background: var(--warn); border: 2px solid var(--surface);
+}
 .box-count {
   position: absolute; top: -6px; right: -6px; min-width: 15px; height: 15px; padding: 0 3px;
   border-radius: 999px; background: var(--accent); color: var(--accent-ink);
@@ -796,6 +848,11 @@ body.scrolled .picker-bar { box-shadow: 0 7px 8px -7px oklch(0.3 0.02 66 / .35);
 .set-field .input { width: 100%; font-size: 13px; }
 .set-narrow { max-width: 140px; }
 .set-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.dev-rows { display: flex; flex-direction: column; gap: 6px; }
+.dev-rows-head, .dev-row { display: grid; grid-template-columns: 2fr 3fr 22px; gap: 8px; align-items: center; }
+.dev-rows-head { font-size: 12.5px; font-weight: 600; color: var(--ink); }
+.dev-row .input { width: 100%; font-size: 13px; min-width: 0; }
+.dev-row .dev-host { font-family: var(--font-mono); font-size: 12.5px; }
 .set-label { font-size: 12.5px; font-weight: 600; color: var(--ink); display: flex; gap: 8px; align-items: baseline; }
 .set-hint { display: block; font-size: 12px; color: var(--ink-faint); line-height: 1.4; }
 .set-check { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; cursor: pointer; }
@@ -833,3 +890,8 @@ body.scrolled .picker-bar { box-shadow: 0 7px 8px -7px oklch(0.3 0.02 66 / .35);
 .mode-popover .mp-row { display: flex; align-items: center; gap: 8px; }
 .mode-popover .mp-cardid { font-size: 11px; color: var(--ink-faint); }
 .mode-popover .mode-sel { font-size: 12px; padding: 5px 7px; width: auto; flex: 1; }
+.dev-row .dev-del {
+  border: 0; background: none; color: var(--ink-faint); font-size: 16px; line-height: 1;
+  padding: 2px 4px; border-radius: 6px; cursor: pointer;
+}
+.dev-row .dev-del:hover { color: var(--accent); }

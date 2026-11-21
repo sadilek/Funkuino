@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -35,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from collections import OrderedDict
 from dataclasses import asdict
@@ -48,6 +50,7 @@ from aiohttp import WSCloseCode, web
 import cards
 import card_backends
 import espuino
+import rfid_cards
 import studio_agent
 import studio_state
 import sync
@@ -119,12 +122,52 @@ def find_claude_cli() -> str | None:
     return next((str(p) for p in CLI_LOCATIONS if p.is_file()), None)
 
 
+class DeviceConn:
+    """One configured ESPuino and everything Studio learnt from it.
+
+    Studio keeps a connection to every configured device at once, not only to
+    the one the switcher shows: card assignments go out to a box as soon as it
+    is reachable, and the switcher can say which boxes are online. Each has
+    its own lock, since one storage operation at a time is a per-device limit.
+    """
+
+    def __init__(self, spec: dict, cfg: espuino.Config):
+        self.id: str = spec["id"]
+        self.name: str = spec.get("name", "")
+        self.cfg = cfg
+        self.mac = ""                                   # from /info (wifi.macAddress)
+        self.client: espuino.ESPuino | None = None      # built lazily (DNS -> executor)
+        self.lock = asyncio.Lock()                      # serialises every device op
+        self.info: dict | None = None                   # last successful /info
+        self.reachable = False                          # last attempt result
+        self.attempted = False                          # was it ever tried?
+        self.listening = False                          # device-ws listener connected
+        self.task: asyncio.Task | None = None           # the listener
+        self.ws: aiohttp.ClientWebSocketResponse | None = None  # reused for controls
+        self.ws_send_lock = asyncio.Lock()
+        self.cards_checked: float | None = None         # last card reconcile
+        # Now-playing (from the listener's trackinfo broadcasts).
+        self.player = dict(IDLE_PLAYER)
+        self.player_last_unit: str | None = None
+
+    @property
+    def label(self) -> str:
+        return self.name or self.cfg.host
+
+    @property
+    def key(self) -> str:
+        """Its identity in the sync manifests and the card table."""
+        return self.mac or self.cfg.host
+
+
+IDLE_PLAYER = {"playing": False, "unitId": None, "name": "", "pausePlay": False}
+
+
 class Studio:
     def __init__(self, cfg: espuino.Config, token: str | None,
                  port: int = DEFAULT_PORT, cards_enabled: bool = True,
                  agent_enabled: bool = True, open_browser: bool = True,
                  overrides: dict[str, str] | None = None):
-        self.cfg = cfg
         self.token = token
         self.port = port
         self.cards_enabled = cards_enabled  # off: hide print tab/column, 404 its API
@@ -136,12 +179,18 @@ class Studio:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.agent: studio_agent.SessionManager | None = None
 
-        # Device: one lazily-built client, one lock serialising every device op.
-        self._client: espuino.ESPuino | None = None
-        self.device_lock = asyncio.Lock()
-        self.device_info: dict | None = None       # last successful /info
-        self.device_reachable = False               # last attempt result
-        self.device_attempted = False               # was /info ever tried?
+        # Devices: one connection per configured ESPuino; the switcher picks
+        # the one the Bibliothek, Sync and the player act on.
+        self.devices: dict[str, DeviceConn] = {}
+        self.active_id = ""
+        self._build_devices(cfg)
+
+        # Cards shared by all devices (status/rfid-cards.json). One lock, so
+        # two devices reconciling at once cannot interleave their changes.
+        self.registry = rfid_cards.CardRegistry.load()
+        self.registry_lock = asyncio.Lock()
+        if w := espuino.state_warning("Die Kartenzuordnung", self.registry.load_status):
+            print(f"WARNUNG: {w}", file=sys.stderr)
 
         # Jobs (one sync, one cards render/CLI at a time; unit syncs by id).
         self.sync_running = False
@@ -162,23 +211,41 @@ class Studio:
         self._ffmpeg: dict | None = None      # see _ffmpeg_state()
         self._thumbs: "OrderedDict[str, bytes]" = OrderedDict()
         self._unit_ids: set[str] = set()  # ids from the last scan (assignment mapping)
-
-        # RFID: a passive device-ws listener + the assignments cache.
-        self.rfid_listening = False
-        self._assignments: list[dict] | None = None   # last GET /rfid (None = never)
-        self._assignments_at: float | None = None      # when we last fetched them
         self._assignment_by_id: dict[str, dict] = {}    # id -> enriched assignment
-        self._rfid_task: asyncio.Task | None = None
+
         self._ws_session: aiohttp.ClientSession | None = None
         self._shutting_down = False
         self._intake_task: asyncio.Task | None = None  # polls session progress files
 
-        # Now-playing (from the listener's trackinfo broadcasts) + a handle on the
-        # listener's ws so player controls reuse it instead of a 2nd connection.
-        self._player = {"playing": False, "unitId": None, "name": "", "pausePlay": False}
-        self._player_last_unit: str | None = None
-        self._device_ws: aiohttp.ClientWebSocketResponse | None = None
-        self._ws_send_lock = asyncio.Lock()
+    # -- devices --
+    def _device_specs(self) -> tuple[list[dict], str]:
+        """The devices to connect to and the active one's id. A --host (or
+        ESPUINO_HOST) pins a single device for this run, as it pinned the one
+        device before there could be several."""
+        config = espuino.read_app_config()
+        saved = espuino.saved_devices(config)
+        if "host" in self.overrides:
+            host = os.environ.get("ESPUINO_HOST") or ""
+            spec = next((d for d in saved if d["host"] == host),
+                        {"id": espuino.LEGACY_DEVICE_ID, "name": "", "host": host})
+            return [spec], spec["id"]
+        return saved, espuino.active_device(config)["id"]
+
+    def _build_devices(self, base: espuino.Config) -> None:
+        specs, active = self._device_specs()
+        self.devices = {s["id"]: DeviceConn(s, dataclasses.replace(base, host=s["host"]))
+                        for s in specs}
+        self.active_id = active
+
+    @property
+    def active(self) -> DeviceConn:
+        return self.devices[self.active_id]
+
+    @property
+    def cfg(self) -> espuino.Config:
+        """The active device's settings (library folder, base folder and login
+        are the same for every device)."""
+        return self.active.cfg
 
     # -- websocket hub --
     def emit(self, msg: dict) -> int:
@@ -202,57 +269,63 @@ class Studio:
             self.loop.call_soon_threadsafe(self.emit, msg)
 
     # -- device client --
-    async def _get_client(self) -> espuino.ESPuino:
+    async def _get_client(self, dev: DeviceConn) -> espuino.ESPuino:
         """Build the client once (DNS resolves in the constructor -> executor)."""
-        if self._client is None:
-            self._client = await self.loop.run_in_executor(
-                None, lambda: espuino.ESPuino(self.cfg))
-        return self._client
+        if dev.client is None:
+            dev.client = await self.loop.run_in_executor(
+                None, lambda: espuino.ESPuino(dev.cfg))
+        return dev.client
 
-    async def ping_device(self) -> dict | None:
-        async with self.device_lock:
-            self.device_attempted = True
+    def _learn_info(self, dev: DeviceConn, info: dict) -> None:
+        dev.info = info
+        dev.mac = (info.get("wifi") or {}).get("macAddress") or dev.mac
+
+    async def ping_device(self, dev: DeviceConn | None = None) -> dict | None:
+        dev = dev or self.active
+        async with dev.lock:
+            dev.attempted = True
             try:
-                client = await self._get_client()
+                client = await self._get_client(dev)
                 info = await asyncio.wait_for(
                     self.loop.run_in_executor(None, client.info), PING_TIMEOUT)
             except Exception:  # noqa: BLE001 - offline is a normal state
-                self.device_reachable = False
+                dev.reachable = False
                 return None
-            self.device_info = info
-            self.device_reachable = True
+            self._learn_info(dev, info)
+            dev.reachable = True
             return info
 
-    # -- RFID device-ws listener (passive, read-only; no device_lock needed) --
-    async def _rfid_listener(self) -> None:
+    # -- RFID device-ws listener (passive, read-only; no device lock needed) --
+    async def _rfid_listener(self, dev: DeviceConn) -> None:
         """Keep a websocket to the device open, translating ``rfidId`` broadcasts
         into browser events. Reconnects with backoff while the device is offline.
-        Listening is passive (tiny frames) so it does not use the device_lock."""
+        Listening is passive (tiny frames) so it does not use the device lock."""
         backoff = RFID_BACKOFF_MIN
         while not self._shutting_down:
             try:
+                name, port = espuino.split_host(dev.cfg.host, dev.cfg.http_port)
                 addr = await self.loop.run_in_executor(
-                    None, lambda: espuino.ESPuino._resolve(self.cfg.host))
-                url = f"ws://{addr}:{self.cfg.http_port}/ws"
+                    None, lambda: espuino.ESPuino._resolve(name))
+                url = f"ws://{addr}:{port}/ws"
                 # receive_timeout (~12 s = 4x the 3 s ping) is what flips the
                 # device to "offline" within ~10-15 s when it is powered off:
                 # no frames arrive, the receive times out, and we fall through.
                 async with self._ws_session.ws_connect(
                         url, autoping=True, heartbeat=None,
                         receive_timeout=RFID_PING_SECS * 4) as ws:
-                    self.rfid_listening = True
-                    self._device_ws = ws                         # reuse for controls
+                    dev.listening = True
+                    dev.ws = ws                                  # reuse for controls
                     backoff = RFID_BACKOFF_MIN
-                    self._set_reachable(True)                    # online (on transition)
-                    self.loop.create_task(self._refresh_info())         # one /info read
-                    self.loop.create_task(self._refresh_assignments())  # one /rfid read
+                    self._set_reachable(dev, True)               # online (on transition)
+                    # One /info read, then the card table: the MAC keys it.
+                    self.loop.create_task(self._on_connected(dev))
                     with contextlib.suppress(Exception):
                         await ws.send_json({"trackinfo": {}})    # warm now-playing
                     ping = self.loop.create_task(self._rfid_ping(ws))
                     try:
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                self._handle_device_msg(msg.data)
+                                self._handle_device_msg(dev, msg.data)
                             elif msg.type in (aiohttp.WSMsgType.CLOSED,
                                               aiohttp.WSMsgType.ERROR):
                                 break
@@ -262,34 +335,38 @@ class Studio:
                             await ping  # retrieve it so it can't orphan an exception
             except Exception:  # noqa: BLE001 - offline/reset is normal, just retry
                 pass
-            self.rfid_listening = False
-            self._device_ws = None
-            self._reset_player()                                # clear stale now-playing
-            self._set_reachable(False)                          # offline (on transition)
+            dev.listening = False
+            dev.ws = None
+            self._reset_player(dev)                             # clear stale now-playing
+            self._set_reachable(dev, False)                     # offline (on transition)
             if self._shutting_down:
                 break
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, RFID_BACKOFF_MAX)
 
-    def _set_reachable(self, reachable: bool) -> None:
+    def _set_reachable(self, dev: DeviceConn, reachable: bool) -> None:
         """Update device reachability from the ws listener and push a
         state.changed only on an actual transition (so repeated offline
         reconnect attempts don't spam the dashboard)."""
-        if self.device_reachable == reachable and self.device_attempted:
+        if dev.reachable == reachable and dev.attempted:
             return
-        self.device_reachable = reachable
-        self.device_attempted = True
+        dev.reachable = reachable
+        dev.attempted = True
         self.emit({"t": "state.changed"})
 
-    async def _refresh_info(self) -> None:
+    async def _on_connected(self, dev: DeviceConn) -> None:
+        await self._refresh_info(dev)
+        await self._reconcile_cards(dev)
+
+    async def _refresh_info(self, dev: DeviceConn) -> None:
         """Refresh the cached /info once after a (re)connect (executor + lock)."""
         try:
-            async with self.device_lock:
-                client = await self._get_client()
+            async with dev.lock:
+                client = await self._get_client(dev)
                 info = await self.loop.run_in_executor(None, client.info)
         except Exception:  # noqa: BLE001
             return
-        self.device_info = info
+        self._learn_info(dev, info)
 
     async def _rfid_ping(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         while True:
@@ -299,7 +376,7 @@ class Studio:
             with contextlib.suppress(Exception):
                 await ws.send_json({"ping": {"ping": "ping"}})
 
-    def _handle_device_msg(self, data: str) -> None:
+    def _handle_device_msg(self, dev: DeviceConn, data: str) -> None:
         try:
             obj = json.loads(data)
         except (ValueError, TypeError):
@@ -307,19 +384,22 @@ class Studio:
         if not isinstance(obj, dict):
             return
         if "rfidId" in obj:                        # ignore pong/status/volume/…
-            self._emit_rfid_card(str(obj["rfidId"]))
+            self._emit_rfid_card(dev, str(obj["rfidId"]))
         elif "trackinfo" in obj:
-            self._handle_trackinfo(obj.get("trackinfo") or {})
+            self._handle_trackinfo(dev, obj.get("trackinfo") or {})
 
-    def _emit_rfid_card(self, tag_id: str) -> None:
+    def _emit_rfid_card(self, dev: DeviceConn, tag_id: str) -> None:
+        """A card placed on any box: the assignment is shared, so the banner
+        offers the same either way; it names the box when there are several."""
         a = self._assignment_by_id.get(tag_id)
         self.emit({"t": "rfid.card", "id": tag_id, "known": a is not None,
+                   "device": dev.label if len(self.devices) > 1 else None,
                    "assignment": None if a is None else {
                        "fileOrUrl": a["fileOrUrl"], "playMode": a["playMode"],
                        "unitId": a["unitId"]}})
 
     # -- now-playing tracking (from trackinfo broadcasts) --
-    def _resolve_playing_unit(self, name: str) -> str | None:
+    def _resolve_playing_unit(self, dev: DeviceConn, name: str) -> str | None:
         """Best-effort map a trackinfo ``name`` to a unit id. The firmware sends
         either the file path (at track start) or the ID3 title (after tags load),
         optionally prefixed with "(N/M): ". Only the path form resolves: a file
@@ -328,7 +408,7 @@ class Studio:
         stripped = _TRACK_PREFIX_RE.sub("", name or "").strip()
         if "/" not in stripped:
             return None                             # an ID3 title, not a path
-        cand = studio_state.assignment_key(stripped, self.cfg.remote_root)  # strip leading slash + remote_root + NFC
+        cand = studio_state.assignment_key(stripped, dev.cfg.remote_root)  # strip leading slash + remote_root + NFC
         if cand in self._unit_ids:
             return cand
         best = None
@@ -337,58 +417,132 @@ class Studio:
                 best = uid
         return best
 
-    def _handle_trackinfo(self, ti: dict) -> None:
+    def _handle_trackinfo(self, dev: DeviceConn, ti: dict) -> None:
         play_mode = ti.get("playMode")
         num = ti.get("numberOfTracks", 0)
         if play_mode in (None, PLAYER_NO_PLAYLIST) or not num:
-            self._reset_player()
+            self._reset_player(dev)
             return
         name = str(ti.get("name") or "")
         pause = bool(ti.get("pausePlay"))
-        uid = self._resolve_playing_unit(name)
+        uid = self._resolve_playing_unit(dev, name)
         if uid is not None:
-            self._player_last_unit = uid
+            dev.player_last_unit = uid
         else:
-            uid = self._player_last_unit            # sticky across ID3/path swaps
-        self._update_player({"playing": not pause, "unitId": uid,
-                             "name": name, "pausePlay": pause})
+            uid = dev.player_last_unit              # sticky across ID3/path swaps
+        self._update_player(dev, {"playing": not pause, "unitId": uid,
+                                  "name": name, "pausePlay": pause})
 
-    def _reset_player(self) -> None:
-        self._player_last_unit = None
-        self._update_player({"playing": False, "unitId": None,
-                             "name": "", "pausePlay": False})
+    def _reset_player(self, dev: DeviceConn) -> None:
+        dev.player_last_unit = None
+        self._update_player(dev, dict(IDLE_PLAYER))
 
-    def _update_player(self, new: dict) -> None:
-        if new != self._player:                     # emit on change only
-            self._player = new
-            self.emit({"t": "player", **new})
+    def _update_player(self, dev: DeviceConn, new: dict) -> None:
+        """Keep each box's now-playing; only the active one's reaches the page."""
+        if new != dev.player:                       # emit on change only
+            dev.player = new
+            if dev is self.devices.get(self.active_id):
+                self.emit({"t": "player", **new})
 
-    async def _device_ws_send(self, payload: dict) -> bool:
+    async def _device_ws_send(self, dev: DeviceConn, payload: dict) -> bool:
         """Send a JSON frame on the listener's open ws (serialized). Returns
         False if the listener is down so the caller can fall back."""
-        ws = self._device_ws
+        ws = dev.ws
         if ws is None or ws.closed:
             return False
-        async with self._ws_send_lock:
+        async with dev.ws_send_lock:
             try:
                 await ws.send_json(payload)
                 return True
             except Exception:  # noqa: BLE001
                 return False
 
-    async def _refresh_assignments(self) -> None:
-        """Read all assignments (passive GET /rfid) and refresh the cache. Keeps
-        the last known list on failure (e.g. a transient drop)."""
-        try:
-            async with self.device_lock:
-                client = await self._get_client()
-                data = await self.loop.run_in_executor(None, lambda: self._get_rfid(client))
-        except Exception:  # noqa: BLE001
-            return
-        self._assignments = data
-        self._assignments_at = time.time()
+    # -- shared card table <-> devices --
+    async def _reconcile_cards(self, dev: DeviceConn) -> None:
+        """Bring one device's card table in line with the shared one (see
+        rfid_cards): read ``GET /rfid``, learn what was changed at the box,
+        push what it lacks, drop what was unassigned meanwhile. Runs whenever
+        the device (re)connects, so a box that was off catches up then."""
+        learned: list[str] = []
+        async with self.registry_lock:
+            try:
+                async with dev.lock:
+                    client = await self._get_client(dev)
+                    if not dev.mac:
+                        info = await self.loop.run_in_executor(None, client.info)
+                        self._learn_info(dev, info)
+                    raw = await self.loop.run_in_executor(None, lambda: self._get_rfid(client))
+            except Exception:  # noqa: BLE001 - offline: try again at the next connect
+                return
+            root = dev.cfg.remote_root
+            table = {}
+            for a in raw:
+                entry = rfid_cards.canonical(a, root)
+                if a.get("id") is not None and entry is not None:
+                    table[str(a["id"])] = entry
+            plan = self.registry.plan(dev.key, table, host=dev.cfg.host)
+            learned = plan.learned
+            failed = 0
+            for tag, entry in plan.push:
+                if not await self._device_card_op(dev, tag, entry):
+                    failed += 1
+            for tag in plan.delete:
+                if not await self._device_card_op(dev, tag, None):
+                    failed += 1
+            await self.loop.run_in_executor(None, self.registry.save)
+            dev.cards_checked = time.time()
+            if plan.push or plan.delete or plan.learned or failed:
+                print(f"Karten {dev.label}: {len(plan.learned)} übernommen, "
+                      f"{len(plan.push) - failed} übertragen, {len(plan.delete)} "
+                      f"entfernt, {failed} fehlgeschlagen", flush=True)
         await self.rescan()  # rebuilds card_map on units + reindexes assignments
         self.emit({"t": "state.changed"})
+        if learned:
+            # Taught at this box: hand it to every other box that is online now.
+            for other in self.devices.values():
+                if other is not dev and other.listening:
+                    self.loop.create_task(self._reconcile_cards(other))
+
+    async def _device_card_op(self, dev: DeviceConn, tag: str, entry: dict | None) -> bool:
+        """POST (entry) or DELETE (None) one card on one device and note the
+        outcome in the shared table. Caller holds registry_lock."""
+        try:
+            async with dev.lock:
+                client = await self._get_client(dev)
+                if entry is None:
+                    await self.loop.run_in_executor(
+                        None, lambda: self._delete_rfid(client, tag))
+                else:
+                    body = {"id": tag, **rfid_cards.to_device(entry, dev.cfg.remote_root)}
+                    await self.loop.run_in_executor(
+                        None, lambda: self._post_rfid(client, body))
+        except Exception:  # noqa: BLE001 - stays pending, retried at the next connect
+            return False
+        if entry is None:
+            self.registry.confirm_deleted(dev.key, tag)
+        else:
+            self.registry.confirm_pushed(dev.key, tag, entry)
+        return True
+
+    async def _send_card(self, tag: str) -> list[str]:
+        """Send one card's current state (assigned or removed) to every device
+        that is online; returns the labels of those that still lack it."""
+        entry = self.registry.cards.get(tag)
+        async with self.registry_lock:
+            for dev in self.devices.values():
+                # Only a device reconciled this run: its `seen` is current.
+                if not dev.listening or dev.cards_checked is None:
+                    continue
+                have = self.registry.seen.get(dev.key, {}).get(tag)
+                if have == entry:
+                    continue
+                await self._device_card_op(dev, tag, entry)
+            await self.loop.run_in_executor(None, self.registry.save)
+        return [d.label for d in self.devices.values()
+                if tag in self.registry.pending(self._registry_key(d))]
+
+    def _registry_key(self, dev: DeviceConn) -> str:
+        return self.registry.key_for(dev.mac, dev.cfg.host)
 
     @staticmethod
     def _get_rfid(client: espuino.ESPuino) -> list[dict]:
@@ -432,11 +586,12 @@ class Studio:
         # lock for the whole upload, so refuse fast instead of hanging.
         if self.sync_running or self.unit_sync_ids:
             return web.json_response({"error": "Andere Aktion läuft"}, status=409)
-        path = espuino.join_remote(self.cfg.remote_root, *Path(unit_id).parts)
+        dev = self.active
+        path = espuino.join_remote(dev.cfg.remote_root, *Path(unit_id).parts)
         playmode = studio_state.DEFAULT_PLAYMODE.get(unit["kind"], 3)
         try:
-            async with self.device_lock:
-                client = await self._get_client()
+            async with dev.lock:
+                client = await self._get_client(dev)
                 await self.loop.run_in_executor(
                     None, lambda: self._play_audio(client, path, playmode))
         except (requests.ConnectionError, requests.Timeout):
@@ -447,13 +602,14 @@ class Studio:
         return web.json_response({"ok": True, "path": path, "playMode": playmode})
 
     async def h_player_stop(self, request: web.Request) -> web.Response:
+        dev = self.active
         payload = {"controls": {"action": espuino.CMD_STOP}}
-        if await self._device_ws_send(payload):     # reuse the listener's ws
+        if await self._device_ws_send(dev, payload):  # reuse the listener's ws
             return web.json_response({"ok": True, "via": "ws"})
         # Listener down: fall back to a short-lived ws via the blocking client.
         try:
-            async with self.device_lock:
-                client = await self._get_client()
+            async with dev.lock:
+                client = await self._get_client(dev)
                 await self.loop.run_in_executor(
                     None, lambda: client.send_command(espuino.CMD_STOP))
         except Exception:  # noqa: BLE001
@@ -489,37 +645,69 @@ class Studio:
                 self.emit({"t": "intake.progress", "sessionId": sid, "progress": snap})
 
     # -- library scan --
-    def _scan(self) -> tuple[list[dict], dict | None]:
-        sync_state, meta = studio_state.pick_manifest(sync.STATE_DIR)
+    def _scan(self, cards_known: bool, cards_table: dict[str, dict],
+              pending: dict[str, set[str]]) -> tuple[list[dict], dict | None]:
+        """Runs in an executor thread; the card table comes in as a copy
+        (the loop thread changes it while a device reconciles)."""
+        dev = self.active
+        # The active device's own manifest. Before this run has read its MAC,
+        # the one last written for its address; with a single device the
+        # newest, as before there could be several.
+        sync_state, meta = studio_state.pick_manifest(
+            sync.STATE_DIR, mac=dev.mac, host=dev.cfg.host,
+            newest_fallback=len(self.devices) == 1)
         print_state = PrintState.load(cards.STATE_FILE)
-        # Only attach card ids once we have ever read /rfid; otherwise omit them.
-        card_map = (studio_state.build_card_map(self._assignments, self.cfg.remote_root)
-                    if self._assignments is not None else None)
+        # Card ids from the shared table, once there is one at all (a device
+        # was read or a card assigned); before that "unknown", not "none".
+        card_map = (studio_state.build_card_map(cards_table)
+                    if cards_known else None)
         units = studio_state.scan(self.cfg, sync_state, print_state,
                                   card_map=card_map)
+        if card_map is not None:
+            for unit in units:
+                # Boxes that do not have this unit's card(s) yet.
+                unit["cardsPending"] = sorted(
+                    label for label, tags in pending.items()
+                    if any(t in tags for t in unit.get("cards", [])))
         return units, meta
 
     async def rescan(self) -> tuple[list[dict], dict | None]:
-        self._state_cache = await self.loop.run_in_executor(None, self._scan)
+        known = self.registry.known
+        table = {tag: dict(entry) for tag, entry in self.registry.cards.items()}
+        pending = {d.label: self.registry.pending(self._registry_key(d))
+                   for d in self.devices.values()}
+        self._state_cache = await self.loop.run_in_executor(
+            None, self._scan, known, table, pending)
         self._unit_ids = {u["id"] for u in self._state_cache[0]}
         self._reindex_assignments()
         return self._state_cache
 
-    # -- RFID assignments cache --
-    def _enrich_assignment(self, a: dict) -> dict:
-        """Add the resolved unitId (or None) to a raw /rfid entry."""
-        key = studio_state.assignment_key(a.get("fileOrUrl", ""), self.cfg.remote_root)
-        return {"id": str(a.get("id")), "fileOrUrl": a.get("fileOrUrl"),
-                "playMode": a.get("playMode"),
-                "unitId": key if key in self._unit_ids else None}
+    # -- RFID assignments (from the shared card table) --
+    def _enrich_assignment(self, tag: str, entry: dict) -> dict:
+        """One card as the UI sees it: the active device's path, the unit it
+        plays (or None) and the boxes still lacking it."""
+        on_device = rfid_cards.to_device(entry, self.cfg.remote_root)
+        unit_id = entry.get("path")
+        return {"id": tag, "fileOrUrl": on_device.get("fileOrUrl"),
+                "playMode": on_device.get("playMode"), "modId": on_device.get("modId"),
+                "unitId": unit_id if unit_id in self._unit_ids else None}
 
     def _reindex_assignments(self) -> None:
-        if self._assignments is None:
-            self._assignment_by_id = {}
-            return
         self._assignment_by_id = {
-            e["id"]: e for e in (self._enrich_assignment(a) for a in self._assignments)
-            if e["id"] is not None}
+            tag: self._enrich_assignment(tag, entry)
+            for tag, entry in self.registry.cards.items()}
+
+    def _devices_payload(self) -> list[dict]:
+        """The switcher's list: every device, its state and how many cards
+        it still has to get."""
+        out = []
+        for dev in self.devices.values():
+            out.append({"id": dev.id, "name": dev.name, "label": dev.label,
+                        "host": dev.cfg.host, "active": dev.id == self.active_id,
+                        "reachable": dev.reachable, "attempted": dev.attempted,
+                        "cardsPending": len(self.registry.pending(self._registry_key(dev)))
+                        if self.registry.known else 0})
+        return out
 
     def _cards_backlog(self) -> dict:
         """Counted from the cover files on disk, like the picker grid and
@@ -615,9 +803,11 @@ class Studio:
         if request.query.get("refresh") or self._state_cache is None:
             await self.rescan()
         units, manifest = self._state_cache
-        device = (None if not self.device_attempted
-                  else {"reachable": self.device_reachable, "info": self.device_info,
-                        "host": self.cfg.host})
+        dev = self.active
+        device = (None if not dev.attempted
+                  else {"reachable": dev.reachable, "info": dev.info,
+                        "host": dev.cfg.host, "id": dev.id, "name": dev.name,
+                        "label": dev.label})
         available = bool(self.agent and self.agent.available)
         agent = {"available": available,
                  "sessions": self.agent.summaries() if self.agent else [],
@@ -637,8 +827,9 @@ class Studio:
                      "unitSync": sorted(self.unit_sync_ids)},
             "agent": agent,
             "cardsBacklog": await self.loop.run_in_executor(None, self._cards_backlog),
-            "rfid": {"listening": self.rfid_listening},
-            "player": self._player,
+            "devices": self._devices_payload(),
+            "rfid": {"listening": dev.listening},
+            "player": dev.player,
             "tools": {"ffmpeg": self._ffmpeg_state()},
             "features": {"cards": self.cards_enabled, "agent": self.agent_enabled},
             "prefs": {"librarySort": _library_sort(), "printType": _print_type()},
@@ -690,15 +881,14 @@ class Studio:
     async def _run_sync(self, dry_run: bool, delete: bool) -> None:
         start = time.monotonic()
         try:
-            async with self.device_lock:
-                client = await self._get_client()
+            dev = self.active
+            async with dev.lock:
+                client = await self._get_client(dev)
                 info = await self.loop.run_in_executor(None, client.info)
-                self.device_info, self.device_reachable = info, True
-                self.device_attempted = True
-                mac = (info.get("wifi") or {}).get("macAddress") or ""
-                device_id = mac or self.cfg.host
-                state = SyncState.load(sync.STATE_DIR, device_id=device_id,
-                                       host=self.cfg.host)
+                self._learn_info(dev, info)
+                dev.reachable = dev.attempted = True
+                state = SyncState.load(sync.STATE_DIR, device_id=dev.key,
+                                       host=dev.cfg.host)
                 if w := espuino.state_warning("Der Abgleichstand",
                                               state.load_status):
                     self.emit({"t": "sync.log", "line": f"WARNUNG: {w}"})
@@ -707,7 +897,7 @@ class Studio:
                     self.emit_threadsafe({"t": "sync.log", "line": line})
 
                 stats = await self.loop.run_in_executor(
-                    None, lambda: sync.mirror(client, self.cfg, state,
+                    None, lambda: sync.mirror(client, dev.cfg, state,
                                               delete=delete, dry_run=dry_run,
                                               log=log))
             # A quiet run produces no further mirror log lines and the closing
@@ -965,15 +1155,14 @@ class Studio:
             if not files:
                 raise RuntimeError("Keine Dateien für diese Einheit gefunden")
 
-            async with self.device_lock:
-                client = await self._get_client()
+            dev = self.active
+            async with dev.lock:
+                client = await self._get_client(dev)
                 info = await self.loop.run_in_executor(None, client.info)
-                self.device_info, self.device_reachable = info, True
-                self.device_attempted = True
-                mac = (info.get("wifi") or {}).get("macAddress") or ""
-                device_id = mac or self.cfg.host
-                state = SyncState.load(sync.STATE_DIR, device_id=device_id,
-                                       host=self.cfg.host)
+                self._learn_info(dev, info)
+                dev.reachable = dev.attempted = True
+                state = SyncState.load(sync.STATE_DIR, device_id=dev.key,
+                                       host=dev.cfg.host)
 
                 def work() -> None:
                     # Mirror-identical semantics for just this unit's files.
@@ -982,7 +1171,7 @@ class Studio:
                     to_upload = []
                     for f in files:
                         rel = f.relative_to(local_dir)
-                        remote = espuino.join_remote(self.cfg.remote_root, *rel.parts)
+                        remote = espuino.join_remote(dev.cfg.remote_root, *rel.parts)
                         size = f.stat().st_size
                         mtime = int(f.stat().st_mtime)
                         if state.is_unchanged(remote, size, mtime):
@@ -1031,11 +1220,16 @@ class Studio:
         self.emit_threadsafe(msg)
 
     # -- RFID assignment endpoints --
+    #
+    # An assignment goes into the shared card table first and then to every
+    # box that is online; a box that is off gets it at its next connect. So
+    # assigning works with any one box reachable (the card was just read on
+    # one), and the response names the boxes still waiting for it.
     async def h_rfid_assignments(self, request: web.Request) -> web.Response:
         return web.json_response({
-            "listening": self.rfid_listening,
+            "listening": self.active.listening,
             "assignments": list(self._assignment_by_id.values()),
-            "fetchedAt": self._assignments_at,
+            "fetchedAt": self.active.cards_checked,
         })
 
     async def h_rfid_assign(self, request: web.Request) -> web.Response:
@@ -1057,7 +1251,7 @@ class Studio:
             play_mode = int(play_mode)
         except (TypeError, ValueError):
             return web.json_response({"error": "Ungültiger Abspielmodus"}, status=400)
-        if play_mode <= 0:
+        if play_mode <= 0 or play_mode >= rfid_cards.MOD_ID_MIN:
             return web.json_response({"error": "Ungültiger Abspielmodus"}, status=400)
 
         # fileOrUrl mirrors the explorer path: leading slash + the unit id (NFC).
@@ -1066,20 +1260,21 @@ class Studio:
             return web.json_response(
                 {"error": "Pfad enthält unzulässige Zeichen (^ oder #)"}, status=400)
 
-        entry = {"id": tag_id, "fileOrUrl": file_or_url, "playMode": play_mode}
-        try:
-            async with self.device_lock:
-                client = await self._get_client()
-                await self.loop.run_in_executor(None, lambda: self._post_rfid(client, entry))
-        except (requests.ConnectionError, requests.Timeout):
-            return web.json_response({"error": "Gerät nicht erreichbar"}, status=503)
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response(
-                {"error": f"Zuordnung fehlgeschlagen: {exc}"}, status=500)
-
-        await self._refresh_assignments()  # re-read /rfid, rescan, state.changed
+        entry = {"path": unit["id"], "playMode": play_mode}
+        async with self.registry_lock:
+            self.registry.assign(tag_id, entry)
+            try:
+                await self.loop.run_in_executor(None, self.registry.save)
+            except OSError as exc:
+                return web.json_response(
+                    {"error": f"Zuordnung nicht gespeichert: {exc}"}, status=500)
+        pending = await self._send_card(tag_id)
+        await self.rescan()
+        self.emit({"t": "state.changed"})
         self.emit({"t": "rfid.assigned", "tagId": tag_id, "unitId": unit_id})
-        return web.json_response({"ok": True, "assignment": entry})
+        return web.json_response({"ok": True, "pending": pending,
+                                  "assignment": {"id": tag_id, "fileOrUrl": file_or_url,
+                                                 "playMode": play_mode}})
 
     async def h_rfid_unassign(self, request: web.Request) -> web.Response:
         body = await _json_body(request)
@@ -1091,19 +1286,19 @@ class Studio:
         if existing is None:
             return web.json_response({"error": "Karte ist nicht zugeordnet"}, status=404)
         unit_id = existing.get("unitId")
-        try:
-            async with self.device_lock:
-                client = await self._get_client()
-                await self.loop.run_in_executor(None, lambda: self._delete_rfid(client, tag_id))
-        except (requests.ConnectionError, requests.Timeout):
-            return web.json_response({"error": "Gerät nicht erreichbar"}, status=503)
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response(
-                {"error": f"Löschen fehlgeschlagen: {exc}"}, status=500)
-
-        await self._refresh_assignments()  # re-read /rfid, rescan, state.changed
+        async with self.registry_lock:
+            self.registry.unassign(tag_id)
+            try:
+                await self.loop.run_in_executor(None, self.registry.save)
+            except OSError as exc:
+                return web.json_response(
+                    {"error": f"Löschen nicht gespeichert: {exc}"}, status=500)
+        pending = await self._send_card(tag_id)
+        await self.rescan()
+        self.emit({"t": "state.changed"})
         self.emit({"t": "rfid.unassigned", "tagId": tag_id, "unitId": unit_id})
-        return web.json_response({"ok": True, "tagId": tag_id, "unitId": unit_id})
+        return web.json_response({"ok": True, "tagId": tag_id, "unitId": unit_id,
+                                  "pending": pending})
 
     # -- agent endpoints --
     def _agent_ready(self) -> web.Response | None:
@@ -1292,7 +1487,14 @@ class Studio:
                 "saved": bool(saved) if key == "http_password" else saved,
                 "override": self.overrides.get(key),
             }
+        config = espuino.read_app_config()
         return {"settings": settings,
+                # The saved list (what the dialog edits); a --host pins one
+                # address for this run instead, which the dialog says.
+                "devices": {"saved": espuino.saved_devices(config),
+                            "active": espuino.active_device(config)["id"],
+                            "override": self.overrides.get("host"),
+                            "overrideHost": self.cfg.host if "host" in self.overrides else None},
                 "dataDir": str(espuino.DATA_ROOT),
                 "configFile": str(espuino.APP_CONFIG_FILE)}
 
@@ -1312,19 +1514,26 @@ class Studio:
         try:
             values = {key: _validate_setting(key, body[key])
                       for key in SETTINGS if key in body}
+            devices = (_validate_devices(body["devices"], espuino.saved_devices())
+                       if "devices" in body else None)
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
         device_change = any(key in DEVICE_SETTINGS and key not in self.overrides
                             and values[key] != _saved_setting(key) for key in values)
+        if devices is not None and "host" not in self.overrides:
+            device_change = device_change or devices != espuino.saved_devices()
         if device_change and (self.sync_running or self.unit_sync_ids):
             return web.json_response(
                 {"error": "Während eines Syncs lässt sich das Gerät nicht ändern."},
                 status=409)
         password = values.pop("http_password", None)
+        changes = {key: (None if value == SETTING_DEFAULTS[key] else value)
+                   for key, value in values.items()}
+        if devices is not None:
+            changes.update(_devices_config(devices, espuino.read_app_config()
+                                           .get("active_device")))
         try:
-            espuino.update_app_config(
-                {key: (None if value == SETTING_DEFAULTS[key] else value)
-                 for key, value in values.items()})
+            espuino.update_app_config(changes)
             if password is not None:
                 espuino.write_env_value(espuino.credentials_file(),
                                         "ESPUINO_HTTP_PASSWORD", password or None)
@@ -1342,31 +1551,59 @@ class Studio:
         self.emit({"t": "state.changed"})
         return web.json_response(self._settings_payload())
 
-    async def _apply_device_config(self, cfg: espuino.Config) -> None:
-        """Switch to another device (or the same one with another base folder
-        or login) without a restart: drop the client and everything learnt from
-        the old device, and reconnect the listener."""
-        if cfg == self.cfg:
-            return
-        if self._rfid_task is not None:
-            self._rfid_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._rfid_task
-        async with self.device_lock:
-            self.cfg = cfg
-            self._client = None
-        self.device_info = None
-        self.device_reachable = False
-        self.device_attempted = False
-        self.rfid_listening = False
-        self._device_ws = None
-        self._reset_player()
-        self._assignments = None
-        self._assignments_at = None
-        self._assignment_by_id = {}
+    async def _apply_device_config(self, base: espuino.Config) -> None:
+        """Switch to another set of devices (or the same ones with another base
+        folder or login) without a restart: drop the connections and everything
+        learnt from them, and reconnect. The card table stays: it belongs to
+        the library, not to a device."""
+        old = self.devices
+        for dev in old.values():
+            if dev.task is not None:
+                dev.task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await dev.task
+        for dev in old.values():
+            async with dev.lock:   # let a running device op finish first
+                dev.client = None
+        self._build_devices(base)
+        self.emit({"t": "player", **self.active.player})
         await self.rescan()  # the base folder maps cards and sync status to units
-        self._rfid_task = self.loop.create_task(self._rfid_listener())
-        self.loop.create_task(self.ping_device())
+        self._start_devices()
+
+    def _start_devices(self) -> None:
+        for dev in self.devices.values():
+            dev.task = self.loop.create_task(self._rfid_listener(dev))
+            self.loop.create_task(self.ping_device(dev))
+
+    async def h_device_select(self, request: web.Request) -> web.Response:
+        """The switcher: which box the Bibliothek, Sync and the player act on.
+
+        Saved in config.json (``active_device``), so the commands the agent
+        runs (`funkuino sync`) talk to the same box as Studio shows. Not while
+        a sync runs: it would finish on one box and be reported on the other.
+        """
+        body = await _json_body(request)
+        dev_id = str(body.get("id") or "")
+        if dev_id not in self.devices:
+            return web.json_response({"error": "Gerät nicht gefunden"}, status=404)
+        if dev_id == self.active_id:
+            return web.json_response({"ok": True, "id": dev_id})
+        if self.sync_running or self.unit_sync_ids:
+            return web.json_response(
+                {"error": "Während eines Syncs lässt sich das Gerät nicht wechseln."},
+                status=409)
+        if "host" not in self.overrides:
+            try:
+                espuino.update_app_config(
+                    _devices_config(espuino.saved_devices(), dev_id))
+            except (OSError, ValueError) as exc:
+                return web.json_response(
+                    {"error": f"Konnte die Auswahl nicht speichern: {exc}"}, status=500)
+        self.active_id = dev_id
+        self.emit({"t": "player", **self.active.player})
+        await self.rescan()       # sync status is per device
+        self.emit({"t": "state.changed"})
+        return web.json_response({"ok": True, "id": dev_id})
 
     async def h_agent_interrupt(self, request: web.Request) -> web.Response:
         guard = self._agent_ready()
@@ -1423,8 +1660,7 @@ class Studio:
             with contextlib.suppress(OSError):
                 stale.unlink()  # leftovers from a previous run
         await self.rescan()
-        self.loop.create_task(self.ping_device())     # populate device chip in bg
-        self._rfid_task = self.loop.create_task(self._rfid_listener())
+        self._start_devices()     # a listener + one ping per device, in the background
         self._intake_task = self.loop.create_task(self._intake_poller())
 
     async def on_shutdown(self, app: web.Application) -> None:
@@ -1439,7 +1675,7 @@ class Studio:
 
     async def on_cleanup(self, app: web.Application) -> None:
         self._shutting_down = True
-        for task in (self._rfid_task, self._intake_task):
+        for task in (*(d.task for d in self.devices.values()), self._intake_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -1486,6 +1722,7 @@ class Studio:
         app.router.add_get("/ws", self.h_ws)
         app.router.add_get("/api/state", self.h_state)
         app.router.add_post("/api/device/ping", self.h_device_ping)
+        app.router.add_post("/api/device/select", self.h_device_select)
         app.router.add_post("/api/sync", self.h_sync)
         app.router.add_post("/api/cards/print", self.h_cards_print)
         app.router.add_post("/api/cards/undo", self.h_cards_undo)
@@ -1552,7 +1789,6 @@ def _consented(name: str) -> bool:
 # then wins, and the dialog says so. The device ones are read by every command
 # through espuino.Config, so `funkuino sync` talks to the device set up here.
 SETTINGS = {
-    "host": {"env": "ESPUINO_HOST"},
     "remote_root": {"env": "ESPUINO_REMOTE_ROOT"},
     "http_user": {"env": "ESPUINO_HTTP_USER"},
     "http_password": {"env": "ESPUINO_HTTP_PASSWORD"},
@@ -1561,9 +1797,9 @@ SETTINGS = {
     "port": {},
     "open_browser": {},
 }
-DEVICE_SETTINGS = ("host", "remote_root", "http_user", "http_password")
+DEVICE_SETTINGS = ("remote_root", "http_user", "http_password")
 SETTING_DEFAULTS = {
-    "host": espuino.DEFAULT_HOST, "remote_root": espuino.DEFAULT_REMOTE_ROOT,
+    "remote_root": espuino.DEFAULT_REMOTE_ROOT,
     "http_user": "", "http_password": "",
     "cards_enabled": True, "agent_enabled": True,
     "port": DEFAULT_PORT, "open_browser": True,
@@ -1606,15 +1842,60 @@ def _validate_setting(key: str, value):
     if key == "http_password":
         return value  # verbatim: spaces may be part of it; "" removes it
     value = value.strip()
-    if key == "host":
-        # Forgive a pasted address: "http://espuino.local/" -> "espuino.local".
-        value = re.sub(r"^https?://", "", value, flags=re.I).rstrip("/")
-        if value and not re.fullmatch(r"[A-Za-z0-9.:\[\]-]+", value):
-            raise ValueError("Die Geräteadresse ist ein Name wie espuino.local "
-                             "oder eine IP-Adresse.")
     if key == "remote_root":
         value = "/" + value.strip("/") if value.strip("/") else ""
     return value or default
+
+
+def _clean_host(value: str) -> str:
+    """A device address from the dialog; ValueError carries the message."""
+    # Forgive a pasted address: "http://espuino.local/" -> "espuino.local".
+    value = re.sub(r"^https?://", "", value.strip(), flags=re.I).rstrip("/")
+    if not value:
+        raise ValueError("Jedes Gerät braucht eine Adresse.")
+    if not re.fullmatch(r"[A-Za-z0-9.:\[\]-]+", value):
+        raise ValueError("Die Geräteadresse ist ein Name wie espuino.local "
+                         "oder eine IP-Adresse.")
+    return value
+
+
+def _validate_devices(value, saved: list[dict]) -> list[dict]:
+    """The device list from the dialog -> ``[{id, name, host}]``. An entry
+    without a known id is a new device and gets one; names and addresses must
+    be unique, since the switcher and `funkuino sync --device` go by them."""
+    if not isinstance(value, list) or not value:
+        raise ValueError("Mindestens ein Gerät muss eingerichtet sein.")
+    known = {d["id"] for d in saved}
+    out: list[dict] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ValueError("Ungültiger Geräteeintrag.")
+        name = str(entry.get("name") or "").strip()
+        host = _clean_host(str(entry.get("host") or ""))
+        dev_id = entry.get("id")
+        if not (isinstance(dev_id, str) and dev_id in known
+                and all(d["id"] != dev_id for d in out)):
+            dev_id = uuid.uuid4().hex[:8]
+        if any(d["host"].lower() == host.lower() for d in out):
+            raise ValueError(f"Die Adresse {host} steht zweimal in der Liste.")
+        if name and any(d["name"].casefold() == name.casefold() for d in out):
+            raise ValueError(f"Der Name {name} steht zweimal in der Liste.")
+        out.append({"id": dev_id, "name": name, "host": host})
+    if len(out) > 1 and not all(d["name"] for d in out):
+        raise ValueError("Bei mehreren Geräten braucht jedes einen Namen.")
+    return out
+
+
+def _devices_config(devices: list[dict], active: str | None) -> dict:
+    """config.json keys for a device list and the active device. ``host``
+    mirrors the active device's address for anything that reads only it (an
+    older Studio, the macOS app's setup screen), and a single unnamed device
+    is written the old way, as just ``host``."""
+    chosen = next((d for d in devices if d["id"] == active), devices[0])
+    host = None if chosen["host"] == espuino.DEFAULT_HOST else chosen["host"]
+    if len(devices) == 1 and not devices[0]["name"]:
+        return {"devices": None, "active_device": None, "host": host}
+    return {"devices": devices, "active_device": chosen["id"], "host": host}
 
 
 def _frontend_version() -> str:
@@ -1739,6 +2020,8 @@ def main(argv: list[str] | None = None) -> int:
 
     overrides = {key: spec["env"] for key, spec in SETTINGS.items()
                  if spec.get("env") and os.environ.get(spec["env"])}
+    if os.environ.get("ESPUINO_HOST"):
+        overrides["host"] = "ESPUINO_HOST"
     if args.host:
         overrides["host"] = "--host"
         # Through the environment, so the commands the agent runs
@@ -1768,8 +2051,10 @@ def main(argv: list[str] | None = None) -> int:
     app = studio.build_app()
 
     url = f"http://127.0.0.1:{port}/"
+    devices = ", ".join(f"{d.label} ({d.cfg.host})" if d.name else d.cfg.host
+                        for d in studio.devices.values())
     print(f"Funkuino Studio at {url}"
-          f"  (device: {cfg.host}, agent: {'on' if token else 'no token'})")
+          f"  (device: {devices}, agent: {'on' if token else 'no token'})")
     if not espuino.find_ffmpeg():
         # Studio itself runs fine without it; downloading and merging do not.
         print(f"WARNING: ffmpeg not found — downloads and merging will fail.\n"

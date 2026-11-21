@@ -22,16 +22,18 @@
  * @typedef {{ id: string, kind: UnitKind, series?: string, title?: string, files?: number,
  *   bytes?: number, mtime?: number, cover?: Cover,
  *   sync?: "synced"|"pending"|"partial"|"unsynced"|"unknown",
- *   print?: "printed"|"changed"|"new"|"no_cover", cards?: string[] }} Unit
+ *   print?: "printed"|"changed"|"new"|"no_cover", cards?: string[], cardsPending?: string[] }} Unit
  * @typedef {{ host?: string, deviceId?: string, fileMtime?: number }} SyncManifest
- * @typedef {{ reachable?: boolean, host?: string|null, info?: any }} Device
+ * @typedef {{ reachable?: boolean, host?: string|null, info?: any, id?: string, name?: string, label?: string }} Device
+ * @typedef {{ id: string, name: string, label: string, host: string, active: boolean,
+ *   reachable: boolean, attempted: boolean, cardsPending: number }} DeviceEntry
  * @typedef {"running"|"waiting_user"|"waiting_input"|"done"|"error"|"interrupted"} AgentStatus
  * @typedef {{ id: string, label?: string, model?: string, status?: AgentStatus, progress?: IntakeProgress|null }} SessionInfo
  * @typedef {{ sync?: boolean, cards?: boolean, unitSync?: string[] }} Jobs
  * @typedef {{ available?: boolean, reason?: string, sessions?: SessionInfo[] }} AgentState
  * @typedef {{ playing?: boolean, unitId?: string|null, name?: string|null, pausePlay?: boolean }} Player
  * @typedef {{ path: string|null, mp3: boolean, hint: string|null }} ToolState
- * @typedef {{ units?: Unit[], syncManifest?: SyncManifest, device?: Device|null, jobs?: Jobs,
+ * @typedef {{ units?: Unit[], syncManifest?: SyncManifest, device?: Device|null, devices?: DeviceEntry[], jobs?: Jobs,
  *   agent?: AgentState, rfid?: { listening: boolean }, player?: Player|null,
  *   tools?: { ffmpeg?: ToolState }, prefs?: { librarySort?: "date"|"alpha", printType?: string },
  *   cards?: { printTypes?: PrintType[] },
@@ -56,7 +58,7 @@
  *   | {t:"cards.log",line?:string} | {t:"cards.done",code?:number}
  *   | {t:"unit.sync",id:string,status:"running"|"progress"|"done"|"error",pct?:number,line?:string,error?:string}
  *   | {t:"intake.progress",sessionId:string,progress:IntakeProgress}
- *   | {t:"rfid.card",id:string,known?:boolean,assignment?:Assignment|null}
+ *   | {t:"rfid.card",id:string,known?:boolean,device?:string|null,assignment?:Assignment|null}
  *   | {t:"rfid.assigned",tagId:string,unitId?:string} | {t:"rfid.unassigned",tagId:string,unitId?:string|null}
  *   | {t:"player",playing?:boolean,unitId?:string|null,name?:string|null,pausePlay?:boolean}
  *   | {t:"state.changed"} | {t:"agent.event",sessionId:string,event:AgentEvent}
@@ -504,12 +506,14 @@ function renderReloadBanner(open) {
 /** Names the dialog uses, for the notes on settings that are not in force. */
 /** @type {Record<string, string>} */
 const SETTING_LABEL = {
-  host: "Adresse", remote_root: "Ordner auf dem Gerät", http_user: "Benutzer",
+  devices: "Geräte", remote_root: "Ordner auf dem Gerät", http_user: "Benutzer",
   http_password: "Passwort", cards_enabled: "Kartendruck", agent_enabled: "Agent",
   port: "Port", open_browser: "Browser beim Start",
 };
 /** @typedef {{ value: any, saved: any, override: string|null }} Setting */
-/** @type {{ settings: Record<string, Setting>, dataDir: string, configFile: string }|null} */
+/** @typedef {{ id?: string, name: string, host: string }} DeviceSpec */
+/** @type {{ settings: Record<string, Setting>, dataDir: string, configFile: string,
+ *   devices: { saved: DeviceSpec[], active: string, override: string|null, overrideHost: string|null } }|null} */
 let settingsData = null;
 let settingsPwClear = false;   // "löschen" clicked: send an empty password
 
@@ -556,6 +560,18 @@ function fillSettings() {
         ". Was hier steht, gilt bei Starts ohne."));
     }
   }
+  fillDeviceRows(settingsData.devices.saved);
+  const devField = form.querySelector('[data-key="devices"]');
+  const oldNote = devField.nextElementSibling;
+  if (oldNote && oldNote.classList.contains("set-override")) oldNote.remove();
+  const ov = settingsData.devices.override;
+  if (ov) {
+    const how = ov.startsWith("-") ? "mit dem Startparameter " : "durch die Umgebungsvariable ";
+    devField.after(el("div", { class: "set-override" },
+      "Für diesen Start auf ein Gerät festgelegt " + how, el("code", { text: ov }),
+      ": ", el("b", { text: settingsData.devices.overrideHost || "" }),
+      ". Die Liste hier gilt bei Starts ohne."));
+  }
   $("#settings-pw-clear").hidden = !settingsData.settings.http_password.saved;
   // The Mac app picks its own port and shows its own window.
   $("#settings-start").hidden = isMacShell();
@@ -568,11 +584,54 @@ function fillSettings() {
   $("#settings-error").hidden = true;
 }
 
+/** One editable row of the device list (name, address, remove).
+ *  @param {DeviceSpec} d */
+function deviceRow(d) {
+  const row = el("div", { class: "dev-row" });
+  if (d.id) row.dataset.id = d.id;
+  const name = el("input", { class: "input dev-name", type: "text", placeholder: "z. B. Katharina",
+    autocomplete: "off", spellcheck: "false", "aria-label": "Name des Geräts" });
+  const host = el("input", { class: "input dev-host", type: "text", placeholder: "espuino.local",
+    autocomplete: "off", spellcheck: "false", "aria-label": "Adresse des Geräts" });
+  name.value = d.name || "";
+  host.value = d.host || "";
+  const del = el("button", { type: "button", class: "in-dismiss dev-del", title: "Gerät entfernen",
+    "aria-label": "Gerät entfernen", text: "×" });
+  del.addEventListener("click", () => { row.remove(); updateDeviceRows(); });
+  row.append(name, host, del);
+  return row;
+}
+
+/** @param {DeviceSpec[]} list */
+function fillDeviceRows(list) {
+  $("#settings-devices").replaceChildren(...list.map(deviceRow));
+  updateDeviceRows();
+}
+
+/** The last device cannot be removed; a single one needs no name. */
+function updateDeviceRows() {
+  const rows = [...$("#settings-devices").querySelectorAll(".dev-row")];
+  for (const r of rows) r.querySelector(".dev-del").hidden = rows.length < 2;
+}
+
+/** @returns {DeviceSpec[]} */
+function readDeviceRows() {
+  return [...$("#settings-devices").querySelectorAll(".dev-row")].map(r => {
+    /** @type {DeviceSpec} */
+    const d = { name: r.querySelector(".dev-name").value.trim(), host: r.querySelector(".dev-host").value.trim() };
+    if (r.dataset.id) d.id = r.dataset.id;
+    return d;
+  }).filter(d => d.name || d.host);
+}
+
 /** What the dialog's fields change against the saved settings. */
 function settingsEdits() {
   /** @type {Record<string, any>} */
   const body = {};
   if (!settingsData) return body;
+  const devices = readDeviceRows();
+  const norm = (/** @type {DeviceSpec[]} */ l) => JSON.stringify(l.map(d => [d.id || "", d.name, d.host]));
+  if (norm(devices) !== norm(settingsData.devices.saved)) body.devices = devices;
   const form = $("#settings-form");
   for (const [key, st] of Object.entries(settingsData.settings)) {
     const input = form.elements.namedItem(key);
@@ -612,9 +671,11 @@ async function saveSettings(ev) {
   closeSettings();
   // Say plainly which of the changes are not in force yet, and why.
   const later = Object.keys(body).filter(k => {
+    if (k === "devices") return !!(settingsData && settingsData.devices.override);
     const st = settingsData && settingsData.settings[k];
     return st && st.value !== st.saved;
   }).map(k => {
+    if (k === "devices") return SETTING_LABEL[k] + ` (für diesen Start mit ${settingsData && settingsData.devices.override} festgelegt)`;
     const st = /** @type {Setting} */ (settingsData && settingsData.settings[k]);
     return SETTING_LABEL[k] + (st.override ? ` (für diesen Start mit ${st.override} festgelegt)`
                                            : " (ab dem nächsten Start)");
@@ -629,6 +690,12 @@ function initSettings() {
   $("#settings-close").addEventListener("click", closeSettings);
   $("#settings-cancel").addEventListener("click", closeSettings);
   $("#settings-form").addEventListener("submit", saveSettings);
+  $("#settings-device-add").addEventListener("click", () => {
+    const row = deviceRow({ name: "", host: "" });
+    $("#settings-devices").append(row);
+    updateDeviceRows();
+    row.querySelector(".dev-name").focus();
+  });
   $("#settings-pw-clear").addEventListener("click", () => {
     settingsPwClear = true;
     const pw = $("#settings-form").elements.namedItem("http_password");
@@ -776,14 +843,19 @@ function cardCell(unit) {
   const assigned = cards.length > 0;
   const pulse = !assigned && !!RFID.active;   // highlight click targets while a card waits
   let variant = assigned ? "ok" : "todo";
+  // Boxes that do not have this card yet (offline when it was assigned).
+  const waiting = assigned ? (unit.cardsPending || []) : [];
   const title = assigned
-    ? "Karte" + (cards.length > 1 ? "n" : "") + ": " + cards.join(", ") + " · Klick: Zuordnung aufheben"
+    ? "Karte" + (cards.length > 1 ? "n" : "") + ": " + cards.join(", ")
+      + (waiting.length ? " · noch nicht auf " + waiting.join(", ") + " (kommt, sobald online)" : "")
+      + " · Klick: Zuordnung aufheben"
     : (RFID.active ? "Aktive Karte hier zuordnen" : "Keiner Karte zugeordnet");
   const box = el("button", {
     class: "box " + variant + " clickable" + (pulse ? " pulse" : ""),
     title, onclick: (/** @type {any} */ e) => { e.stopPropagation(); onCardBoxClick(unit); },
   }, assigned ? "✓" : "");
   if (assigned && cards.length > 1) box.append(el("span", { class: "box-count", text: String(cards.length) }));
+  if (waiting.length) box.append(el("span", { class: "box-wait", "aria-hidden": "true" }));
   // Hover/focus opens the play-mode popover (assigned units, or empty+active card).
   box.addEventListener("mouseenter", () => showModePopover(box, unit));
   box.addEventListener("mouseleave", schedulePopoverHide);
@@ -1061,20 +1133,111 @@ function renderToolBanner(tools) {
 
 /* =============================== 6. Sync =============================== */
 
+/** The configured devices (from /api/state); several = the chip is a switcher. */
+function deviceList() { return /** @type {DeviceEntry[]} */ ((State.data && State.data.devices) || []); }
+
 /** @param {Device|null} dev */
 function renderDeviceChip(dev) {
   const chip = $("#device-chip");
   const online = !!(dev && dev.reachable);
+  const several = deviceList().length > 1;
   chip.classList.toggle("online", online);
   chip.classList.toggle("offline", !online);
-  const host = (dev && (dev.host || (dev.info && (dev.info.hostname || dev.info.host)))) ||
+  chip.classList.toggle("switcher", several);
+  const active = deviceList().find(d => d.active);
+  const host = (several && active && active.label) ||
+    (dev && (dev.host || (dev.info && (dev.info.hostname || dev.info.host)))) ||
+    (active && active.host) ||
     (State.data && State.data.syncManifest && State.data.syncManifest.host) || "ESPuino";
   $("#device-chip-text").textContent = host + (online ? " · online" : " · offline");
+  $("#device-chip .chip-caret").hidden = !several;
+  chip.title = several ? "Kiste wechseln" : "Gerät anpingen";
+  chip.setAttribute("aria-haspopup", several ? "menu" : "false");
+  if ($("#device-menu").matches(":popover-open")) renderDeviceMenu();
+}
+
+// The switcher: one row per box with its online state and how many cards it
+// still has to get; choosing one makes it the box Bibliothek, Sync and the
+// player act on. A popover="auto" gives light dismiss and Escape for free;
+// it is placed under the chip by script (anchor positioning is too new for
+// the macOS app's web view).
+function renderDeviceMenu() {
+  const box = $("#device-menu-items");
+  box.replaceChildren();
+  for (const d of deviceList()) {
+    const state = !d.attempted ? "wird gesucht…" : d.reachable ? "online" : "offline";
+    const item = el("button", {
+      type: "button", class: "dm-item" + (d.active ? " active" : "") + (d.reachable ? " online" : ""),
+      role: "menuitemradio", "aria-checked": d.active ? "true" : "false",
+      onclick: () => selectDevice(d.id),
+    },
+      el("span", { class: "led", "aria-hidden": "true" }),
+      el("span", { class: "dm-text" },
+        el("b", { text: d.label }),
+        el("span", { class: "dm-sub", text: (d.name ? d.host + " · " : "") + state })),
+    );
+    if (d.cardsPending)
+      item.append(el("span", { class: "dm-pending", title: "Karten, die diese Kiste noch nicht hat — sie kommen, sobald sie online ist",
+        text: d.cardsPending + (d.cardsPending === 1 ? " Karte offen" : " Karten offen") }));
+    box.append(item);
+  }
+}
+
+function placeDeviceMenu() {
+  const r = $("#device-chip").getBoundingClientRect();
+  const menu = $("#device-menu");
+  menu.style.top = (r.bottom + 6) + "px";
+  menu.style.right = Math.max(8, window.innerWidth - r.right) + "px";
+}
+
+/** @param {MouseEvent} ev */
+function onDeviceChipClick(ev) {
+  if (deviceList().length < 2) { pingDevice(); return; }
+  const menu = $("#device-menu");
+  if (menu.matches(":popover-open")) { menu.hidePopover(); return; }
+  renderDeviceMenu();
+  placeDeviceMenu();
+  menu.showPopover();
+  // Keyboard opens (detail 0) enter the menu at the chosen box.
+  if (ev.detail === 0) {
+    const cur = menu.querySelector(".dm-item.active") || menu.querySelector(".dm-item");
+    if (cur) cur.focus();
+  }
+}
+
+/** @param {KeyboardEvent} ev */
+function onDeviceMenuKey(ev) {
+  const items = [...$("#device-menu").querySelectorAll(".dm-item")];
+  const i = items.indexOf(/** @type {any} */ (document.activeElement));
+  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(ev.key)) return;
+  ev.preventDefault();
+  const n = items.length;
+  const next = ev.key === "Home" ? 0 : ev.key === "End" ? n - 1
+    : i < 0 ? 0 : (i + (ev.key === "ArrowUp" ? -1 : 1) + n) % n;
+  items[next].focus();
+}
+
+/** @param {string} id */
+async function selectDevice(id) {
+  const menu = $("#device-menu");
+  if (menu.matches(":popover-open")) menu.hidePopover();
+  $("#device-chip").focus({ focusVisible: false });
+  const d = deviceList().find(x => x.id === id);
+  if (!d || d.active) return;
+  try {
+    await api("/api/device/select", "POST", { id });
+    toast("Kiste gewechselt: " + d.label, "ok");
+    State.player = null;
+    await refreshState();
+  } catch (/** @type {any} */ e) { toast(e.message); }
 }
 
 /** @param {StatePayload} s */
 function renderSyncPanel(s) {
   setSyncRunning(!!(s.jobs && s.jobs.sync));
+  const several = (s.devices || []).length > 1;
+  $("#device-title").textContent = several && s.device && s.device.label
+    ? "Gerät: " + s.device.label : "Gerät";
   const info = (s.device && s.device.info) || null;
   const dl = $("#device-info");
   dl.replaceChildren();
@@ -1225,19 +1388,28 @@ async function pingDevice() {
   try {
     const resp = await api("/api/device/ping", "POST");
     const info = (resp && resp.info) || resp;
-    const host = (State.data && State.data.device && State.data.device.host) || null;
-    renderDeviceChip({ reachable: true, info, host });
-    if (State.data) { State.data.device = { reachable: true, info, host }; renderSyncPanel(State.data); }
+    const prev = (State.data && State.data.device) || {};
+    const now = { ...prev, reachable: true, info };
+    if (State.data) {
+      State.data.device = now;
+      const entry = deviceList().find(d => d.active);
+      if (entry) { entry.reachable = true; entry.attempted = true; }
+      renderSyncPanel(State.data);
+    }
+    renderDeviceChip(now);
     toast("Gerät erreichbar", "ok");
   } catch (/** @type {any} */ e) {
     // Flip reachability in the shared state and re-render the panel from it
     // (keep the cached info/host); the chip + Status row must agree.
     const dev = (State.data && State.data.device) || {};
+    const now = { ...dev, reachable: false };
     if (State.data) {
-      State.data.device = { reachable: false, info: dev.info, host: dev.host };
+      State.data.device = now;
+      const entry = deviceList().find(d => d.active);
+      if (entry) { entry.reachable = false; entry.attempted = true; }
       renderSyncPanel(State.data);
     }
-    renderDeviceChip({ reachable: false, info: dev.info, host: dev.host });
+    renderDeviceChip(now);
     toast("Gerät nicht erreichbar");
   } finally { chip.style.opacity = ""; }
 }
@@ -2072,21 +2244,23 @@ function titleForAssignment(a) {
 function handleRfidCard(m) {
   if (!m.id) return;
   RFID.active = { id: m.id, assignment: m.assignment || null };
-  showRfidBanner(!!m.known, m.id, titleForAssignment(m.assignment));
+  showRfidBanner(!!m.known, m.id, titleForAssignment(m.assignment), m.device || null);
   renderLibrary();   // pulse empty Karte boxes as click targets
 }
 
 // Sticky banner = the assignment mode itself, so it lingers ~60 s.
-/** @param {boolean} known @param {string} id @param {string} title */
-function showRfidBanner(known, id, title) {
+/** @param {boolean} known @param {string} id @param {string|null} title @param {string|null} device */
+function showRfidBanner(known, id, title, device) {
   const bar = $("#rfid-banner");
   bar.replaceChildren();
   bar.classList.toggle("known", known);
   bar.classList.toggle("unknown", !known);
   const text = el("span", { class: "rb-text" });
-  if (known) text.append("Karte erkannt: ", el("b", { text: title || "unbekannter Titel" }),
+  // With several boxes, say which one read it (the assignment is shared anyway).
+  const where = device ? " auf " + device : "";
+  if (known) text.append("Karte erkannt" + where + ": ", el("b", { text: title || "unbekannter Titel" }),
     document.createTextNode(" – zum Neu-Zuordnen eine Karte-Box anklicken"));
-  else text.append("Neue Karte aufgelegt ", el("span", { class: "mono", text: "(" + id + ")" }),
+  else text.append("Neue Karte aufgelegt" + where + " ", el("span", { class: "mono", text: "(" + id + ")" }),
     document.createTextNode(" – leere Karte-Box eines Titels anklicken"));
   const dismiss = el("button", { class: "in-dismiss", title: "Ausblenden", text: "×" });
   dismiss.addEventListener("click", clearActiveCard);
@@ -2124,12 +2298,11 @@ async function assignActiveCard(unit) {
   // and a wrong assignment is one click to fix.
   const playMode = RFID.pendingMode.get(unit.id) || defaultPlayMode(unit.kind);
   try {
-    await api("/api/rfid/assign", "POST", { tagId: act.id, unitId: unit.id, playMode });
-    toast("Karte zugeordnet: " + (unit.title || unit.id), "ok");
+    const r = await api("/api/rfid/assign", "POST", { tagId: act.id, unitId: unit.id, playMode });
+    toast("Karte zugeordnet: " + (unit.title || unit.id) + waitingNote(r), "ok");
     clearActiveCard();
   } catch (/** @type {any} */ e) {
-    if (e.status === 503) toast("Gerät nicht erreichbar. Zuordnung nicht gespeichert.");
-    else toast("Zuordnung fehlgeschlagen: " + e.message);
+    toast("Zuordnung fehlgeschlagen: " + e.message);
   }
 }
 
@@ -2156,15 +2329,21 @@ function openUnassign(unit) {
 }
 function closeUnassign() { const d = $("#unassign-dialog"); if (d.close) d.close(); else d.removeAttribute("open"); }
 
+/** The boxes an assignment has not reached yet, for the toast.
+ *  @param {any} r */
+function waitingNote(r) {
+  const waiting = (r && r.pending) || [];
+  return waiting.length ? " — " + waiting.join(", ") + " bekommt sie, sobald online" : "";
+}
+
 /** @param {string} tagId */
 async function doUnassign(tagId) {
   try {
-    await api("/api/rfid/unassign", "POST", { tagId });
-    toast("Zuordnung aufgehoben", "ok");
+    const r = await api("/api/rfid/unassign", "POST", { tagId });
+    toast("Zuordnung aufgehoben" + waitingNote(r), "ok");
     return true;
   } catch (/** @type {any} */ e) {
-    if (e.status === 503) toast("Gerät nicht erreichbar.");
-    else toast("Aufheben fehlgeschlagen: " + e.message);
+    toast("Aufheben fehlgeschlagen: " + e.message);
     return false;
   }
 }
@@ -2217,12 +2396,11 @@ async function showModePopover(box, unit) {
 /** @param {string} tagId @param {Unit} unit @param {number} playMode */
 async function changeMode(tagId, unit, playMode) {
   try {
-    await api("/api/rfid/assign", "POST", { tagId, unitId: unit.id, playMode });
-    toast("Modus geändert", "ok");
+    const r = await api("/api/rfid/assign", "POST", { tagId, unitId: unit.id, playMode });
+    toast("Modus geändert" + waitingNote(r), "ok");
     invalidateAssignments();
   } catch (/** @type {any} */ e) {
-    if (e.status === 503) toast("Gerät nicht erreichbar.");
-    else toast("Änderung fehlgeschlagen: " + e.message);
+    toast("Änderung fehlgeschlagen: " + e.message);
   }
 }
 
@@ -2261,7 +2439,14 @@ function initSyncCards() {
   $("#sync-run").addEventListener("click", () => startSync(false, false));
   $("#sync-del").addEventListener("click", () => startSync(false, true));
   $("#device-ping").addEventListener("click", pingDevice);
-  $("#device-chip").addEventListener("click", pingDevice);
+  $("#device-chip").addEventListener("click", onDeviceChipClick);
+  $("#device-menu").addEventListener("keydown", onDeviceMenuKey);
+  $("#device-menu").addEventListener("toggle", (/** @type {any} */ e) => {
+    $("#device-chip").setAttribute("aria-expanded", e.newState === "open" ? "true" : "false");
+  });
+  $("#device-menu-ping").addEventListener("click", () => { $("#device-menu").hidePopover(); pingDevice(); });
+  $("#device-menu-manage").addEventListener("click", () => { $("#device-menu").hidePopover(); openSettings(); });
+  window.addEventListener("resize", () => { if ($("#device-menu").matches(":popover-open")) placeDeviceMenu(); });
 
   $("#cards-print").addEventListener("click", () => cardsAction("/api/cards/print", { dryRun: false, printType: State.printType }, "Drucken"));
   $("#cards-dry").addEventListener("click", () => cardsAction("/api/cards/print", { dryRun: true, printType: State.printType }, "Dry-Run"));

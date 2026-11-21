@@ -30,6 +30,10 @@ print bar, assign RFID cards straight from the library view.
   hears every card placement. Put an unknown card on the box, click the row it
   should belong to — assigned (with sensible play-mode defaults per content
   type).
+- **Several boxes, one library:** set up one ESPuino per child and switch
+  between them in the header. Library and covers are shared, and so are the
+  cards: one taught on either box is sent to the other as soon as it is
+  reachable.
 - **Integrated card printing** with the same manifest and `--undo` semantics as
   the command line — every cover as a thumbnail (newest first, printed ones
   greyed out), hand-pick covers onto a sheet or one-click the oldest full page:
@@ -59,7 +63,7 @@ app puts them on your PATH as `funkuino <command>`.
   trusted), size-scaled timeouts for big audiobook files, `--delete` with
   guard rails, automatic NFC/NFD Unicode normalisation (macOS vs. device), and
   per-device manifests keyed by MAC address — mirror the same library to two
-  ESPuinos without confusion.
+  ESPuinos without confusion (`--device NAME` picks one set up in Studio).
 - **`funkuino download` — audio intake in the library's conventions.** A yt-dlp
   wrapper that lands audio as your library expects it: songs, albums with
   ordered track numbers, or audiobooks (Hörspiele) — multi-part episodes merged

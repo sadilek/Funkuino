@@ -53,10 +53,14 @@ class SyncState:
     load_status: str = "missing"   # see espuino.read_json_state
     backed_up: bool = False        # one previous-good copy per run
 
+    @staticmethod
+    def file_name(device_id: str) -> str:
+        return f"sync-{_slug(device_id)}.json"
+
     @classmethod
     def load(cls, state_dir: str | Path, device_id: str, host: str = "") -> "SyncState":
         """Load (or start) the manifest for ``device_id`` inside ``state_dir``."""
-        path = Path(state_dir) / f"sync-{_slug(device_id)}.json"
+        path = Path(state_dir) / cls.file_name(device_id)
         data, status = espuino.read_json_state(path)
         return cls(
             path=path,

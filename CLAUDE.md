@@ -40,12 +40,14 @@ Funkuino/
   cards                 # wrapper: lay out card-covers/ into printable PDFs
   studio                # wrapper: Funkuino Studio web app (dashboard + agent)
   dev/shot.py           # headless screenshots of Studio (checkout-only, not shipped)
+  dev/fake_espuino.py   # a simulated ESPuino on localhost (checkout-only)
   pyproject.toml        # the wheel: pipx-installable (see Python package)
   hatch_build.py        # build hook: dependencies come from requirements.txt
   scripts/
     cli.py              # the command dispatcher (bin/funkuino and the console script)
     espuino.py          # HTTP API client + device quirks (the knowledge lives here)
     sync_state.py       # per-device upload manifest
+    rfid_cards.py       # RFID card table shared by all devices + reconcile logic
     sync.py             # the rsync-style mirror CLI
     download.py         # yt-dlp download in the ESPuino naming conventions
     prepare.py          # concat + spoken intro (Hörspiel merge)
@@ -63,7 +65,7 @@ Funkuino/
   print-sheets/         # git-ignored; generated printable PDFs
   requirements.txt      # requests, websocket-client, yt-dlp, Pillow, aiohttp, claude-agent-sdk
   .venv/                # git-ignored; created from requirements.txt
-  status/               # git-ignored; sync-<mac>.json + print-history.json + README.txt
+  status/               # git-ignored; sync-<mac>.json, print-history.json, rfid-cards.json, README.txt
 ```
 
 External tools: **ffmpeg** (audio conversion/merge) and macOS **`say`** (spoken
@@ -565,11 +567,43 @@ cards), **Agent**, **Sync** (mirror with live log; Dry-Run always previews
   `config.json` (`POST /api/prefs`, read back via `/api/state` → `prefs`), not
   in localStorage: that is keyed by origin *including the port*, and the macOS
   app starts Studio on a fresh port every launch.
+- **Several devices** (one box per child, one library): config.json holds
+  `devices: [{id, name, host}]` plus `active_device`; without the list there
+  is one device from the old `host` key, and a single unnamed device is
+  written back that way (`espuino.saved_devices` / `active_device`,
+  `studio._devices_config`). `host` is kept equal to the active device's
+  address for anything that reads only it. Base folder and login are shared.
+  The header chip becomes a switcher (popover menu) once there are two;
+  switching (`POST /api/device/select`) re-points Bibliothek, Sync and the
+  player and is saved, so `funkuino sync` follows it (`--device NAME` picks
+  another). Refused while a sync runs. Studio keeps a `DeviceConn` per
+  device — client, lock, listener, now-playing — and connects to all at
+  once, so cards reach a box whenever it is on; only the active box's
+  `player` events reach the page. The Sync column reads the active device's
+  manifest by MAC, before the MAC is known by the address stored in it.
+  `--host`/`ESPUINO_HOST` pin a single device for the run, as before. An
+  address may carry a port (`host:8080`, `espuino.split_host`), which is how
+  `dev/fake_espuino.py` runs several simulated boxes on one machine.
+- **Cards are shared** (`rfid_cards.py`, `status/rfid-cards.json`): Studio
+  assigns into one table and reconciles every device against it at each
+  connect: entries stored library-relative (`path`), verbatim
+  (`fileOrUrl`, e.g. web radio) or as `modId`. Per device MAC it remembers
+  the table it last saw, which tells "changed at the box" (wins, is learnt
+  and sent to the other boxes) from "box is behind" (gets the shared value).
+  A device seen the first time adds what the table lacks; on a conflict the
+  table wins. A card missing on a box is pushed again, never read as a
+  deletion (a wiped NVS must get its cards back, not wipe the other box);
+  only an unassign in Studio deletes, via a tombstone a box that was off
+  applies later. Only differing entries are POSTed: `POST /rfid` resets the
+  card's saved play position. Assigning needs no box online (it is stored
+  and sent later); the response, the toast, the Karte box (amber dot) and
+  the switcher ("N Karten offen") name the boxes still waiting.
 - **RFID assignment lives in the Bibliothek**: Studio keeps a passive, persistent
-  websocket to the device (3 s `{"ping":{"ping":"ping"}}` keepalive, reconnect
+  websocket to each device (3 s `{"ping":{"ping":"ping"}}` keepalive, reconnect
   with backoff) — it hears every card placement (`{"rfidId": …}` broadcast),
-  shows a sticky banner, and a click on a row's Karte-box assigns the card via
-  the device's `POST /rfid` (playMode defaults per kind: song 1, Hörspiel 3,
+  shows a sticky banner (naming the box when there are several), and a click
+  on a row's Karte-box assigns the card into the shared table and on to every
+  box via `POST /rfid` (playMode defaults per kind: song 1, Hörspiel 3,
   album/Folge 5; hover popover edits the mode). This listener also drives the
   online/offline display (connection drop ⇒ offline within ~15 s).
 - **Download progress**: `download.py` writes a JSON status snapshot when

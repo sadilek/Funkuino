@@ -20,6 +20,7 @@ Examples:
     ./sync --dry-run       # show what would change, touch nothing
     ./sync --delete        # also remove device files not present locally
     ./sync --host 192.168.1.42
+    ./sync --device Katharina   # one of the devices set up in Studio
 """
 
 from __future__ import annotations
@@ -198,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--host", help="ESPuino hostname or IP")
+    parser.add_argument("--device", help="A device set up in Studio, by name "
+                                         "(default: the one chosen in Studio)")
     parser.add_argument("--local-dir", help="Local directory to mirror from")
     parser.add_argument("--remote-root", help="Remote root directory on the device")
     parser.add_argument("--delete", action="store_true",
@@ -210,9 +213,14 @@ def main(argv: list[str] | None = None) -> int:
                              "off by default so partial leftovers are re-uploaded)")
     args = parser.parse_args(argv)
 
-    cfg = espuino.Config.from_env(
-        host=args.host, local_dir=args.local_dir, remote_root=args.remote_root
-    )
+    try:
+        cfg = espuino.Config.from_env(
+            device=args.device, host=args.host, local_dir=args.local_dir,
+            remote_root=args.remote_root)
+    except ValueError as exc:
+        names = ", ".join(espuino.device_label(d) for d in espuino.saved_devices())
+        print(f"ERROR: {exc} Eingerichtet: {names}", file=sys.stderr)
+        return 2
 
     client = espuino.ESPuino(cfg)
 
