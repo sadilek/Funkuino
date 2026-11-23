@@ -763,7 +763,10 @@ here have **no** `/SD-Card` prefix (that prefix only exists over FTP).
   `equalizer`, `wifi`, `led`, `buttons`, `rotary`, `battery`, `playlist`,
   `mediahub`, `ftp`, `mqtt`, `bluetooth`, `current`).
   `POST /settings` (`Content-Type: application/json`) with one or more
-  sections writes them to NVS and applies them live, with no restart. A
+  sections writes them to NVS and applies most of them live. **Not live**:
+  `pauseIfRfidRemoved`, `dontAcceptRfidTwice`, `resumeOnSameRfid` (read once
+  in `AudioPlayer_Init`) and `pn5180Debounce` (read at RFID task start) only
+  take effect after a restart (firmware 3.2, `cd74e9b`). A
   section is written as a whole, and most missing keys become 0/false, so
   post each section exactly as GET returned it. To copy settings from one box
   to another, post `general`, `equalizer`, `led`, `buttons`, `battery`,
@@ -831,6 +834,21 @@ here have **no** `/SD-Card` prefix (that prefix only exists over FTP).
   degrades range), feed PN5180 with 5 V not 3.3 V, lower rfidGain, module
   quality variance. Our 275 ms instrumentation is more precise than anything
   posted upstream — worth a #428 comment / forum post (draft on request).
+  **Restarts despite #444 (2026-11-23, Katharina's box, firmware 3.2
+  `cd74e9b`):** one card (`9a-f4-d8-06`, a 4-byte-UID tag like the Sams
+  cards, unlike the NXP `04-…` majority) was lost ~1 s after every read, the
+  silent heal mostly gave up, and the reader re-found it only after 3–30 s —
+  i.e. real read failures even right after a reset, not the HALT/REQA issue
+  #444 fixed. With `pauseIfRfidRemoved` *and* `dontAcceptRfidTwice` both off,
+  every re-detection is a fresh card apply (`xQueueSend` regardless), so the
+  album restarted at track 1 every few seconds. Fix chosen with the owner:
+  `dontAcceptRfidTwice` + `resumeOnSameRfid` on both boxes (in 3.2 the lock
+  is released once the playlist finishes, so the same card restarts a
+  finished album and resumes a paused one). `pauseIfRfidRemoved` would have
+  paused for seconds at every dropout instead. The PN5180 has no sensitivity
+  setting in the web UI (`mfrc522Gain` is MFRC522-only); TX/RX tuning would
+  need a firmware fork. Diagnose from `GET /log`: `wedge/removal suspected` +
+  `silent heal gave up` followed by a new `RFID-Karte erkannt` of the same tag.
 - **Device traffic degrades playback.** Uploads and even recursive listings
   contend with active playback for Wi-Fi and SD on the ESP32 — the audio
   stutters until the traffic stops (observed live: a background sync test made
