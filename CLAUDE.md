@@ -746,6 +746,20 @@ here have **no** `/SD-Card` prefix (that prefix only exists over FTP).
   → rename/move.
 - `GET /explorerdownload?path=<file>` → download (404 if missing).
 - `GET /info` → device/software/hardware/memory JSON.
+- `GET /log` → the log since boot (ring buffer). Try it first for hardware
+  questions: it shows what the firmware brought up, e.g. `LED: 24 LEDs via
+  SPI`, port expander found, PN5180 firmware version, SD mount.
+- `GET /settings` → every setting, grouped into sections (`general`,
+  `equalizer`, `wifi`, `led`, `buttons`, `rotary`, `battery`, `playlist`,
+  `mediahub`, `ftp`, `mqtt`, `bluetooth`, `current`).
+  `POST /settings` (`Content-Type: application/json`) with one or more
+  sections writes them to NVS and applies them live, with no restart. A
+  section is written as a whole, and most missing keys become 0/false, so
+  post each section exactly as GET returned it. To copy settings from one box
+  to another, post `general`, `equalizer`, `led`, `buttons`, `battery`,
+  `playlist`, and leave these per-box: `wifi` (hostname), `mqtt`, `ftp`,
+  `current`, `battery.offsetVoltage` (calibration) and `rotary.reverse`, which
+  compensates for how the encoder is wired. Verified 2026-11-23.
 - Websocket `ws://<host>/ws`: `{"controls":{"action":<CMD>}}` triggers a control
   command (codes in the ESPuino source, `src/values.h`), e.g. 183 = restart,
   170 = play/pause. `{"ftpStatus":{"start":1}}` starts the FTP server.
