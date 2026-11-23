@@ -997,6 +997,9 @@ Two artifacts, one version: `pyproject.toml` owns it and `mac/Makefile` derives
 6. Attach the DMG(s) to the GitHub release. Then install the *published* wheel
    somewhere clean (`pipx install funkuino` in a container) before announcing
    it — the artifact on PyPI is what users get, not the one in `dist/`.
+7. Finally, install `Funkuino.app` from the signed DMG
+   (`mac/build/Funkuino-<version>-<arch>.dmg`) into `/Applications`, replacing
+   the old version there, so the app in daily use is the one that was shipped.
 
 **Why this stays local** (decided 2026-08-03, revisit if it chafes): moving it
 to GitHub Actions would mainly buy the Intel DMG, since `macos-13` runners
