@@ -622,6 +622,16 @@ works*), **Kartendruck** (the full card picker, integrated; sheets are
   box via `POST /rfid` (playMode defaults per kind: song 1, Hörspiel 3,
   album/Folge 5; hover popover edits the mode). This listener also drives the
   online/offline display (connection drop ⇒ offline within ~15 s).
+- **A title can have several cards** (duplicates, e.g. one printed card per
+  child). The table is keyed by tag, so this needs nothing server-side; the
+  UI decides: with a card on the reader that a unit does not have yet, a click
+  on its Karte box *adds* it — onto an assigned unit too (it pulses then),
+  taking over the playMode of the unit's first card. Only without a card on
+  the reader, or with one of the unit's own cards on it, does the click open
+  the unassign dialog, which marks the card lying on the reader. A card
+  assigned elsewhere moves (a tag plays one thing). Each tag keeps its own
+  saved play position on the box (`AudioPlayer_NvsRfidWriteWrapper` is keyed
+  by tag), so two children's copies of a Hörspiel do not share a position.
 - **Offline says why.** Listener and ping keep the last failure per box
   (`DeviceConn.error`, from `failure_reason()`: the innermost OS error of the
   requests/aiohttp chain, DNS and timeouts by name). It goes to `/api/state`

@@ -844,15 +844,23 @@ function cardCell(unit) {
   const cards = unit.cards;
   if (cards == null) return boxCell("na", "RFID-Status unbekannt");
   const assigned = cards.length > 0;
-  const pulse = !assigned && !!RFID.active;   // highlight click targets while a card waits
+  // A card on the reader can go onto any title that does not have it yet;
+  // onto one that already has a card it becomes an additional one (a duplicate).
+  const onReader = RFID.active ? RFID.active.id : null;
+  const canAdd = !!onReader && !cards.includes(onReader);
+  const pulse = canAdd;   // highlight click targets while a card waits
   let variant = assigned ? "ok" : "todo";
   // Boxes that do not have this card yet (offline when it was assigned).
   const waiting = assigned ? (unit.cardsPending || []) : [];
-  const title = assigned
-    ? "Karte" + (cards.length > 1 ? "n" : "") + ": " + cards.join(", ")
-      + (waiting.length ? " · noch nicht auf " + waiting.join(", ") + " (kommt, sobald online)" : "")
-      + " · Klick: Zuordnung aufheben"
-    : (RFID.active ? "Aktive Karte hier zuordnen" : "Keiner Karte zugeordnet");
+  let title;
+  if (!assigned) title = onReader ? "Aufgelegte Karte hier zuordnen" : "Keiner Karte zugeordnet";
+  else {
+    title = "Karte" + (cards.length > 1 ? "n" : "") + ": " + cards.join(", ")
+      + (waiting.length ? " · noch nicht auf " + waiting.join(", ") + " (kommt, sobald online)" : "");
+    if (canAdd) title += " · Klick: aufgelegte Karte zusätzlich zuordnen";
+    else if (onReader) title += " · aufgelegte Karte gehört schon hierher · Klick: Zuordnung aufheben";
+    else title += " · Klick: Zuordnung aufheben · weitere Karte: auflegen, dann hier klicken";
+  }
   const box = el("button", {
     class: "box " + variant + " clickable" + (pulse ? " pulse" : ""),
     title, onclick: (/** @type {any} */ e) => { e.stopPropagation(); onCardBoxClick(unit); },
@@ -2318,9 +2326,9 @@ function showRfidBanner(known, id, title, device) {
   // With several boxes, say which one read it (the assignment is shared anyway).
   const where = device ? " auf " + device : "";
   if (known) text.append("Karte erkannt" + where + ": ", el("b", { text: title || "unbekannter Titel" }),
-    document.createTextNode(" – zum Neu-Zuordnen eine Karte-Box anklicken"));
+    document.createTextNode(" – Karte-Box eines anderen Titels anklicken, um sie dorthin umzuhängen"));
   else text.append("Neue Karte aufgelegt" + where + " ", el("span", { class: "mono", text: "(" + id + ")" }),
-    document.createTextNode(" – leere Karte-Box eines Titels anklicken"));
+    document.createTextNode(" – Karte-Box eines Titels anklicken; hat er schon eine Karte, wird das eine weitere"));
   const dismiss = el("button", { class: "in-dismiss", title: "Ausblenden", text: "×" });
   dismiss.addEventListener("click", clearActiveCard);
   bar.append(el("span", { class: "rb-icon", text: known ? "🏷" : "✨" }), text,
@@ -2340,13 +2348,15 @@ function clearActiveCard() {
   renderLibrary();
 }
 
-// Karte box click: assigned → offer to remove; empty → assign active card or hint.
+// A card on the reader that this unit lacks is added (a title may have several
+// cards, e.g. one per child); without one, or with one of its own cards on the
+// reader, an assigned box offers removal.
 /** @param {Unit} unit */
 function onCardBoxClick(unit) {
   const cards = unit.cards || [];
+  if (RFID.active && !cards.includes(RFID.active.id)) { assignActiveCard(unit); return; }
   if (cards.length) { openUnassign(unit); return; }
-  if (!RFID.active) { toast("Karte auflegen zum Zuordnen"); return; }
-  assignActiveCard(unit);
+  toast("Karte auflegen zum Zuordnen");
 }
 
 /** @param {Unit} unit */
@@ -2355,10 +2365,23 @@ async function assignActiveCard(unit) {
   if (!act) return;
   // Reassigning directly, no confirm — the success toast is confirmation enough
   // and a wrong assignment is one click to fix.
-  const playMode = RFID.pendingMode.get(unit.id) || defaultPlayMode(unit.kind);
+  const existing = unit.cards || [];
+  // A further card plays like the ones the title already has, unless a mode
+  // was picked in the popover for this assignment.
+  let playMode = RFID.pendingMode.get(unit.id);
+  if (!playMode && existing.length) {
+    const first = (await fetchAssignments()).find(a => a.id === existing[0]);
+    if (first && first.playMode) playMode = first.playMode;
+  }
+  if (!playMode) playMode = defaultPlayMode(unit.kind);
+  const name = unit.title || unit.id;
   try {
     const r = await api("/api/rfid/assign", "POST", { tagId: act.id, unitId: unit.id, playMode });
-    toast("Karte zugeordnet: " + (unit.title || unit.id) + waitingNote(r), "ok");
+    // A card plays one thing: placed on another title, it moves there.
+    const from = act.assignment && act.assignment.unitId !== unit.id ? titleForAssignment(act.assignment) : null;
+    const msg = (from ? "Karte umgehängt von " + from + " nach " : existing.length ? "Weitere Karte zugeordnet: " : "Karte zugeordnet: ")
+      + name + (existing.length ? " (jetzt " + (existing.length + 1) + " Karten)" : "");
+    toast(msg + waitingNote(r), "ok");
     clearActiveCard();
   } catch (/** @type {any} */ e) {
     toast("Zuordnung fehlgeschlagen: " + e.message);
@@ -2375,7 +2398,9 @@ function openUnassign(unit) {
   body.replaceChildren(el("div", { class: "subtle", text: unit.title || unit.id }));
   for (const id of cards) {
     const btn = el("button", { class: "btn danger", text: cards.length === 1 ? "Zuordnung aufheben" : "Entfernen" });
-    const row = el("div", { class: "unassign-row" }, el("span", { class: "mono", text: "Karte " + id }), btn);
+    const label = el("span", { class: "mono", text: "Karte " + id });
+    if (RFID.active && RFID.active.id === id) label.append(el("span", { class: "ur-here", text: " · liegt auf" }));
+    const row = el("div", { class: "unassign-row" }, label, btn);
     btn.addEventListener("click", async () => {
       btn.disabled = true;
       if (await doUnassign(id)) { row.remove(); if (!body.querySelector(".unassign-row")) closeUnassign(); }
