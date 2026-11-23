@@ -33,21 +33,32 @@ print bar, assign RFID cards straight from the library view.
 - **Several boxes, one library:** set up one ESPuino per child and switch
   between them in the header. Library and covers are shared, and so are the
   cards: one taught on either box is sent to the other as soon as it is
-  reachable.
+  reachable. When a box is offline, Studio says why: switched off, name not
+  found, or a Mac that blocks the local network.
+- **No second upload of a filled box:** if you filled a box's SD card at a
+  computer, the first sync asks whether to take over the files already there
+  instead of uploading the whole library again over Wi-Fi.
 - **Integrated card printing** with the same manifest and `--undo` semantics as
   the command line — every cover as a thumbnail (newest first, printed ones
   greyed out), hand-pick covers onto a sheet or one-click the oldest full page:
 
 ![Funkuino Studio — card printing](https://raw.githubusercontent.com/sadilek/Funkuino/main/docs/screenshots/karten.png)
 
+- **Or order finished cards:** instead of an A4 sheet, the selection can
+  become a draft order at Kartenschmiede, a small independent service that
+  prints the covers on plastic RFID cards. Studio asks once before the first
+  cover leaves your computer, and you review and pay on the service's page.
 - **Embedded Claude agent** (optional, [Claude Agent
   SDK](https://docs.anthropic.com/en/api/agent-sdk/overview)): paste a URL into
   the library tab and an agent session handles the intake — probe, classify
   (song/album/audiobook), download with the right flags, verify naming and
   covers, report back — asking *you* whenever a judgment call is needed
   (episode numbering, attribution, intro wording), via question cards in the
-  browser. Permission model: read-only tools and the project's own commands are
-  auto-allowed, risky ones always raise an approval card. Needs your own
+  browser. New downloads take over the spelling of a series or artist already
+  in your library and continue its episode numbering, and a conversation
+  picks up where it left off after a restart. Permission model: read-only
+  tools and the project's own commands are auto-allowed, risky ones always
+  raise an approval card. Needs your own
   [Claude Code](https://claude.com/claude-code) installation and a subscription
   token — the Agent tab walks you through both.
 
@@ -64,20 +75,24 @@ app puts them on your PATH as `funkuino <command>`.
   guard rails, automatic NFC/NFD Unicode normalisation (macOS vs. device), and
   per-device manifests keyed by MAC address — mirror the same library to two
   ESPuinos without confusion (`--device NAME` picks one set up in Studio).
+  `--adopt-existing` trusts the files already on a box filled by hand, once.
 - **`funkuino download` — audio intake in the library's conventions.** A yt-dlp
   wrapper that lands audio as your library expects it: songs, albums with
   ordered track numbers, or audiobooks (Hörspiele) — multi-part episodes merged
   into a single MP3 with a spoken title intro (macOS `say`), correct tags, and
   the full-resolution title image saved separately for card printing (covers
   are deliberately *not* embedded in the audio: the device has no display and a
-  large leading ID3 tag makes playback start-stutter).
+  large leading ID3 tag makes playback start-stutter). `--probe <url>`
+  downloads nothing and prints what a link contains: playlist, durations,
+  tags, and the names a download would choose.
 - **`funkuino prepare` / `funkuino covers`** — the audiobook merge as a standalone tool, and
   batch extraction of embedded cover art from an existing library.
 - **`funkuino cards` — printable RFID card sheets.** Lays title images out as
   edge-to-edge 6×6 cm squares on A4 PDFs (12 per page) with cut tick marks in
   the margins. Print, stick an RFID tag on each card's back, laminate, cut. A
   print manifest makes a bare `funkuino cards` mean "everything new since last
-  time", with stackable `--undo`.
+  time", with stackable `--undo`. `--backend kartenschmiede` orders the same
+  selection as printed RFID cards instead.
 
 ## Extensions — your own commands and your own agent
 
@@ -93,6 +108,10 @@ repository, because both live in *your* library folder:
   tracks. An optional `<name>.permissions.json` (`{"allow": [...], "ask": [...]}`)
   declares how the embedded agent may call it — an extension that declares
   nothing simply needs your approval every time.
+- **`extensions/card_backends/<name>.py` adds a print medium** to
+  `funkuino cards --backend` and to Studio's printer choice, next to the A4
+  sheet and Kartenschmiede. The contract is in
+  `scripts/card_backends/__init__.py`.
 - **`CLAUDE.md` in your library folder teaches the agent your conventions.**
   It is loaded into every agent session on top of the project's own
   instructions: how you want a particular series named, that a certain source
