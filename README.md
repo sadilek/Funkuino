@@ -29,7 +29,8 @@ print bar, assign RFID cards straight from the library view.
 - **Live RFID assignment:** Studio keeps a passive websocket to the device and
   hears every card placement. Put an unknown card on the box, click the row it
   should belong to — assigned (with sensible play-mode defaults per content
-  type).
+  type). A title can have several cards, say one per child: put another card
+  on the box and click the same row again.
 - **Several boxes, one library:** set up one ESPuino per child and switch
   between them in the header. Library and covers are shared, and so are the
   cards: one taught on either box is sent to the other as soon as it is
