@@ -27,11 +27,13 @@ import argparse
 import asyncio
 import contextlib
 import dataclasses
+import errno
 import io
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -143,6 +145,7 @@ class DeviceConn:
         self.info: dict | None = None                   # last successful /info
         self.reachable = False                          # last attempt result
         self.attempted = False                          # was it ever tried?
+        self.error: str | None = None                   # why the last attempt failed
         self.listening = False                          # device-ws listener connected
         self.task: asyncio.Task | None = None           # the listener
         self.ws: aiohttp.ClientWebSocketResponse | None = None  # reused for controls
@@ -163,6 +166,38 @@ class DeviceConn:
 
 
 IDLE_PLAYER = {"playing": False, "unitId": None, "name": "", "pausePlay": False}
+
+
+def failure_reason(exc: BaseException) -> str:
+    """A short, human answer to "why is this box offline?" from whatever a
+    connect raised (requests, urllib3 and aiohttp each wrap the socket error
+    one or two levels deep): the innermost OS error wins, since that is what
+    tells a box that is off from a Mac that refuses to talk to it."""
+    chain, seen = [], set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        chain.append(cur)
+        cur = cur.__cause__ or cur.__context__
+    for err in reversed(chain):
+        if isinstance(err, socket.gaierror):     # its errno is an EAI_* code
+            return f"Name nicht auflösbar ({err.strerror})"
+        if isinstance(err, OSError) and err.errno is not None:
+            # os.strerror, not err.strerror: asyncio puts "Connect call
+            # failed ('ip', port)" there, while requests gets the plain text.
+            text = os.strerror(err.errno)
+            if err.errno == errno.EHOSTUNREACH and sys.platform == "darwin":
+                # Measured: a box that is off answers EHOSTDOWN; EHOSTUNREACH
+                # for a LAN address is macOS's Local Network block, which spares
+                # ping and curl and hit a terminal tab older than an iTerm update.
+                text += (" — macOS blockiert das lokale Netz für diesen Prozess."
+                         " Studio aus einem neuen Terminalfenster starten oder"
+                         " die Freigabe „Lokales Netzwerk“ prüfen")
+            return text
+    if any(isinstance(err, (TimeoutError, requests.Timeout)) for err in chain):
+        return "keine Antwort (Zeitüberschreitung)"
+    text = str(exc) or type(exc).__name__
+    return text if len(text) <= 200 else text[:199] + "…"
 
 
 class Studio:
@@ -290,12 +325,33 @@ class Studio:
                 client = await self._get_client(dev)
                 info = await asyncio.wait_for(
                     self.loop.run_in_executor(None, client.info), PING_TIMEOUT)
-            except Exception:  # noqa: BLE001 - offline is a normal state
+            except Exception as exc:  # noqa: BLE001 - offline is a normal state
                 dev.reachable = False
+                self._note_failure(dev, exc)
                 return None
             self._learn_info(dev, info)
             dev.reachable = True
+            self._note_success(dev)
             return info
+
+    def _note_failure(self, dev: DeviceConn, exc: BaseException) -> None:
+        """Keep why a box is offline, and say so on the console once per new
+        reason (the listener retries every 5-60 s; a line per retry would
+        bury everything else). Offline used to be a bare "offline": a Mac
+        refusing the connection looked exactly like a box that is off."""
+        reason = failure_reason(exc)
+        if reason == dev.error:
+            return
+        dev.error = reason
+        print(f"{dev.label} ({dev.cfg.host}) nicht erreichbar: {reason}",
+              file=sys.stderr, flush=True)
+        self.emit({"t": "state.changed"})
+
+    def _note_success(self, dev: DeviceConn) -> None:
+        if dev.error is not None:
+            print(f"{dev.label} ({dev.cfg.host}) wieder erreichbar",
+                  file=sys.stderr, flush=True)
+            dev.error = None
 
     # -- RFID device-ws listener (passive, read-only; no device lock needed) --
     async def _rfid_listener(self, dev: DeviceConn) -> None:
@@ -318,6 +374,7 @@ class Studio:
                     dev.listening = True
                     dev.ws = ws                                  # reuse for controls
                     backoff = RFID_BACKOFF_MIN
+                    self._note_success(dev)
                     self._set_reachable(dev, True)               # online (on transition)
                     # One /info read, then the card table: the MAC keys it.
                     self.loop.create_task(self._on_connected(dev))
@@ -335,8 +392,8 @@ class Studio:
                         ping.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await ping  # retrieve it so it can't orphan an exception
-            except Exception:  # noqa: BLE001 - offline/reset is normal, just retry
-                pass
+            except Exception as exc:  # noqa: BLE001 - offline/reset is normal, just retry
+                self._note_failure(dev, exc)
             dev.listening = False
             dev.ws = None
             self._reset_player(dev)                             # clear stale now-playing
@@ -707,6 +764,7 @@ class Studio:
             out.append({"id": dev.id, "name": dev.name, "label": dev.label,
                         "host": dev.cfg.host, "active": dev.id == self.active_id,
                         "reachable": dev.reachable, "attempted": dev.attempted,
+                        "error": None if dev.reachable else dev.error,
                         "cardsPending": len(self.registry.pending(self._registry_key(dev)))
                         if self.registry.known else 0})
         return out
@@ -809,7 +867,8 @@ class Studio:
         device = (None if not dev.attempted
                   else {"reachable": dev.reachable, "info": dev.info,
                         "host": dev.cfg.host, "id": dev.id, "name": dev.name,
-                        "label": dev.label})
+                        "label": dev.label,
+                        "error": None if dev.reachable else dev.error})
         available = bool(self.agent and self.agent.available)
         agent = {"available": available,
                  "sessions": self.agent.summaries() if self.agent else [],
@@ -858,7 +917,10 @@ class Studio:
     async def h_device_ping(self, request: web.Request) -> web.Response:
         info = await self.ping_device()
         if info is None:
-            return web.json_response({"error": "Gerät nicht erreichbar"}, status=503)
+            reason = self.active.error
+            return web.json_response(
+                {"error": "Gerät nicht erreichbar" + (f": {reason}" if reason else "")},
+                status=503)
         return web.json_response({"reachable": True, "info": info})
 
     # -- sync job --

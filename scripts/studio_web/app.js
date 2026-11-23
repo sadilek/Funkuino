@@ -24,9 +24,10 @@
  *   sync?: "synced"|"pending"|"partial"|"unsynced"|"unknown",
  *   print?: "printed"|"changed"|"new"|"no_cover", cards?: string[], cardsPending?: string[] }} Unit
  * @typedef {{ host?: string, deviceId?: string, fileMtime?: number }} SyncManifest
- * @typedef {{ reachable?: boolean, host?: string|null, info?: any, id?: string, name?: string, label?: string }} Device
+ * @typedef {{ reachable?: boolean, host?: string|null, info?: any, id?: string, name?: string, label?: string,
+ *   error?: string|null }} Device
  * @typedef {{ id: string, name: string, label: string, host: string, active: boolean,
- *   reachable: boolean, attempted: boolean, cardsPending: number }} DeviceEntry
+ *   reachable: boolean, attempted: boolean, error?: string|null, cardsPending: number }} DeviceEntry
  * @typedef {"running"|"waiting_user"|"waiting_input"|"done"|"error"|"interrupted"} AgentStatus
  * @typedef {{ id: string, label?: string, model?: string, status?: AgentStatus, progress?: IntakeProgress|null }} SessionInfo
  * @typedef {{ sync?: boolean, cards?: boolean, unitSync?: string[] }} Jobs
@@ -1153,7 +1154,10 @@ function renderDeviceChip(dev) {
     (State.data && State.data.syncManifest && State.data.syncManifest.host) || "ESPuino";
   $("#device-chip-text").textContent = host + (online ? " · online" : " · offline");
   $("#device-chip .chip-caret").hidden = !several;
-  chip.title = several ? "Kiste wechseln" : "Gerät anpingen";
+  // Why it is offline, from the server's last attempt: a box that is off
+  // and a Mac that refuses the connection look the same otherwise.
+  const why = !online && dev && dev.error ? "\nNicht erreichbar: " + dev.error : "";
+  chip.title = (several ? "Kiste wechseln" : "Gerät anpingen") + why;
   chip.setAttribute("aria-haspopup", several ? "menu" : "false");
   if ($("#device-menu").matches(":popover-open")) renderDeviceMenu();
 }
@@ -1171,6 +1175,7 @@ function renderDeviceMenu() {
     const item = el("button", {
       type: "button", class: "dm-item" + (d.active ? " active" : "") + (d.reachable ? " online" : ""),
       role: "menuitemradio", "aria-checked": d.active ? "true" : "false",
+      title: d.error ? "Nicht erreichbar: " + d.error : null,
       onclick: () => selectDevice(d.id),
     },
       el("span", { class: "led", "aria-hidden": "true" }),
@@ -1244,8 +1249,10 @@ function renderSyncPanel(s) {
   const info = (s.device && s.device.info) || null;
   const dl = $("#device-info");
   dl.replaceChildren();
+  const why = s.device && !s.device.reachable && s.device.error;
   if (!info) {
-    dl.append(el("div", { class: "subtle", style: "grid-column:1/3", text: "Noch keine Geräteinfo. „Ping“ drücken." }));
+    dl.append(el("div", { class: "subtle", style: "grid-column:1/3",
+      text: why ? "Nicht erreichbar: " + why : "Noch keine Geräteinfo. „Ping“ drücken." }));
     return;
   }
   // ESPuino /info nests everything: {software:{version,branch}, hardware:{model},
@@ -1255,6 +1262,7 @@ function renderSyncPanel(s) {
   const version = String(sw.version || "").replace(/^Software-revision:\s*/i, "");
   const rows = [
     ["Status", (s.device && s.device.reachable) ? "online" : "offline (letzter Stand)"],
+    ["Grund", why || null],
     ["Host", s.device && s.device.host],
     ["IP", wifi.ip],
     ["WLAN", wifi.rssi != null ? wifi.rssi + " dBm" : null],
@@ -1461,7 +1469,7 @@ async function pingDevice() {
       renderSyncPanel(State.data);
     }
     renderDeviceChip(now);
-    toast("Gerät nicht erreichbar");
+    toast(e.message || "Gerät nicht erreichbar");
   } finally { chip.style.opacity = ""; }
 }
 

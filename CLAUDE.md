@@ -622,6 +622,20 @@ works*), **Kartendruck** (the full card picker, integrated; sheets are
   box via `POST /rfid` (playMode defaults per kind: song 1, Hörspiel 3,
   album/Folge 5; hover popover edits the mode). This listener also drives the
   online/offline display (connection drop ⇒ offline within ~15 s).
+- **Offline says why.** Listener and ping keep the last failure per box
+  (`DeviceConn.error`, from `failure_reason()`: the innermost OS error of the
+  requests/aiohttp chain, DNS and timeouts by name). It goes to `/api/state`
+  (`device.error`, `devices[].error`), the chip and switcher tooltips, a
+  "Grund" row in the Sync tab and the ping toast, and to stderr once per new
+  reason plus a "wieder erreichbar" line. It used to be a bare "offline":
+  finding the case below took an afternoon.
+- **`[Errno 65] No route to host` for every box = macOS's Local Network
+  block**, not the boxes. Observed 2026-11-23: Studio started from an iTerm
+  tab older than an iTerm update (its shell still hung off the previous
+  version's `iTermServer-3.7.6` daemon) could reach no box, while `ping`,
+  `curl` and Python from a newer tab could. A box that is off answers
+  `EHOSTDOWN` ("Host is down") instead. Fix: start Studio from a new
+  window/tab, or check System Settings → Privacy & Security → Local Network.
 - **Download progress**: `download.py` writes a JSON status snapshot when
   `FUNKUINO_PROGRESS_FILE` is set (strictly inert otherwise — see
   `scripts/progress.py`); Studio sets it per agent session and streams the
